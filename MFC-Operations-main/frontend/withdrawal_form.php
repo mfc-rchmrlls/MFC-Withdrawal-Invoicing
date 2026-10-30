@@ -621,7 +621,9 @@ foreach ($values as $item) {
                 input.value = productLabel(product);
                 selectedId.value = String(product.product_id);
                 closeSuggestions();
-                input.dispatchEvent(new Event('selectionchange', { bubbles: true }));
+                input.dispatchEvent(new Event('selectionchange', {
+                    bubbles: true
+                }));
             }
 
             function renderSuggestions() {
@@ -633,7 +635,7 @@ foreach ($values as $item) {
                     return;
                 }
                 matches = productCatalog.filter(product => [product.product_name, product.ht_code, product.ht_description]
-                    .some(value => String(value || '').toLocaleLowerCase().includes(query)))
+                        .some(value => String(value || '').toLocaleLowerCase().includes(query)))
                     .slice(0, 12);
                 matches.forEach(product => {
                     const option = document.createElement('button');
@@ -657,7 +659,9 @@ foreach ($values as $item) {
                 activeIndex = (index + options.length) % options.length;
                 options.forEach((option, optionIndex) => option.setAttribute('aria-selected', optionIndex === activeIndex ? 'true' : 'false'));
                 input.setAttribute('aria-activedescendant', options[activeIndex].id);
-                options[activeIndex].scrollIntoView({ block: 'nearest' });
+                options[activeIndex].scrollIntoView({
+                    block: 'nearest'
+                });
             }
 
             input.addEventListener('input', renderSuggestions);
@@ -960,7 +964,7 @@ foreach ($values as $item) {
                 const productIdInput = row.querySelector('.product-id');
                 const quantityInput = row.querySelector('.item-quantity');
 
-                    const productName = productInput.value.trim();
+                const productName = productInput.value.trim();
                 const productId = productIdInput.value.trim();
                 const quantityValue = quantityInput.value.trim();
                 const quantity = Number(quantityValue);
@@ -1015,7 +1019,11 @@ foreach ($values as $item) {
                 event.preventDefault();
                 clientName.classList.add('is-invalid');
                 clientName.setAttribute('aria-invalid', 'true');
-                Swal.fire({ icon: 'warning', title: 'Choose a client', text: 'Select an active client from the suggestions before saving.' }).then(() => clientName.focus());
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'Choose a client',
+                    text: 'Select an active client from the suggestions before saving.'
+                }).then(() => clientName.focus());
                 return;
             }
 

@@ -141,10 +141,10 @@ foreach ($lines as $ln) {
     </div>
 </div>
 
-<div class="notice warning">
+<!-- <div class="notice warning">
     <strong>QuickBooks posting is unavailable:</strong>
     this installation has no Web Connector service or verified company-file mappings. Drafts save locally; sending is disabled to prevent unsupported fields or duplicate inventory effects.
-</div>
+</div> -->
 
 <form
     method="post"
@@ -332,7 +332,7 @@ foreach ($lines as $ln) {
                                     class="form-control table-input invoice-unit"
                                     name="items[<?= $i ?>][u_m]"
                                     value="<?= e($ln['u_m'] ?? '') ?>"
-                                    <?= $locked ? 'readonly' : '' ?>>
+                                    readonly>
                             </td>
 
                             <td>

@@ -119,8 +119,10 @@ if ($compileStatus !== 0) {
 $secret = 'phase3c-bridge-http-test-secret-0123456789';
 $previousSecret = getenv('WQ_QB_BRIDGE_SECRET');
 $previousLocalAppData = getenv('LOCALAPPDATA');
+$previousWriteEnabled = getenv('WQ_QB_INVOICE_WRITE_ENABLED');
 putenv('WQ_QB_BRIDGE_SECRET=' . $secret);
 putenv('LOCALAPPDATA=' . $tempDirectory);
+putenv('WQ_QB_INVOICE_WRITE_ENABLED=false');
 $process = proc_open(
     [$executable],
     [0 => ['file', 'NUL', 'r'], 1 => ['file', 'NUL', 'w'], 2 => ['file', 'NUL', 'w']],
@@ -137,6 +139,11 @@ if ($previousLocalAppData === false) {
     putenv('LOCALAPPDATA');
 } else {
     putenv('LOCALAPPDATA=' . $previousLocalAppData);
+}
+if ($previousWriteEnabled === false) {
+    putenv('WQ_QB_INVOICE_WRITE_ENABLED');
+} else {
+    putenv('WQ_QB_INVOICE_WRITE_ENABLED=' . $previousWriteEnabled);
 }
 if (!is_resource($process)) {
     throw new RuntimeException('Could not start the compiled bridge.');
@@ -161,14 +168,14 @@ try {
     $health = $client->health();
     server_test_assert($health['available'] && $health['response']['sdkRegistered'] === true, 'PHP client validates a live C# bridge health response and HMAC');
 
-    $healthBody = json_encode(['operation' => 'health', 'requestId' => '11111111-1111-4111-8111-111111111111'], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-    $requestId = '11111111-1111-4111-8111-111111111111';
+    $requestId = qb_export_uuid();
+    $healthBody = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $valid = server_test_request('http://127.0.0.1:8765/health', $healthBody, $requestId, 'health', $secret);
     server_test_assert($valid['status'] === 200 && server_test_verify_response($valid, $requestId, $secret), 'bridge success response is authenticated over exact response bytes');
     $replay = server_test_request('http://127.0.0.1:8765/health', $healthBody, $requestId, 'health', $secret);
     server_test_assert($replay['status'] === 409 && server_test_verify_response($replay, $requestId, $secret), 'bridge rejects a replayed nonce and signs the rejection');
 
-    $requestId = '22222222-2222-4222-8222-222222222222';
+    $requestId = qb_export_uuid();
     $body = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $invalidSignature = server_test_request(
         'http://127.0.0.1:8765/health',
@@ -179,9 +186,9 @@ try {
         null,
         str_repeat('0', 64)
     );
-    server_test_assert($invalidSignature['status'] === 401 && server_test_verify_response($invalidSignature, '22222222-2222-4222-8222-222222222222', $secret), 'bridge rejects invalid request HMAC and authenticates the error response');
+    server_test_assert($invalidSignature['status'] === 401 && server_test_verify_response($invalidSignature, $requestId, $secret), 'bridge rejects invalid request HMAC and authenticates the error response');
 
-    $requestId = '33333333-3333-4333-8333-333333333333';
+    $requestId = qb_export_uuid();
     $body = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $stale = server_test_request(
         'http://127.0.0.1:8765/health',
@@ -193,34 +200,85 @@ try {
     );
     server_test_assert($stale['status'] === 401, 'bridge rejects stale signed timestamps');
 
+    $requestId = qb_export_uuid();
     $extraFieldBody = json_encode([
         'operation' => 'health',
-        'requestId' => '44444444-4444-4444-8444-444444444444',
+        'requestId' => $requestId,
         'unexpected' => 'not-allowed',
     ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $extraField = server_test_request(
         'http://127.0.0.1:8765/health',
         $extraFieldBody,
-        '44444444-4444-4444-8444-444444444444',
+        $requestId,
         'health',
         $secret
     );
     server_test_assert($extraField['status'] === 400, 'bridge rejects unexpected JSON fields');
 
+    $requestId = qb_export_uuid();
     $unknownBody = json_encode([
         'operation' => 'InvoiceAdd',
-        'requestId' => '55555555-5555-4555-8555-555555555555',
+        'requestId' => $requestId,
     ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $unknown = server_test_request(
         'http://127.0.0.1:8765/InvoiceAdd',
         $unknownBody,
-        '55555555-5555-4555-8555-555555555555',
+        $requestId,
         'InvoiceAdd',
         $secret
     );
     server_test_assert($unknown['status'] === 400, 'transaction-creation operation is rejected before SDK access');
 
-    $requestId = '66666666-6666-4666-8666-666666666666';
+    $requestId = qb_export_uuid();
+    $submitBody = json_encode([
+        'protocolVersion' => '1',
+        'requestId' => $requestId,
+        'operation' => 'submit',
+        'transactionType' => 'invoice',
+        'idempotencyKey' => str_repeat('a', 64),
+        'source' => ['id' => 1, 'revision' => str_repeat('a', 64)],
+        'transaction' => [
+            'customer' => ['listId' => 'CUST-LIST-1'],
+            'txnDate' => '2026-10-23',
+            'refNumber' => 'INV-TEST',
+            'poNumber' => null,
+            'memo' => null,
+            'lines' => [[
+                'item' => ['listId' => 'ITEM-LIST-1'],
+                'description' => 'Test line',
+                'quantity' => '2',
+                'rate' => '10.00',
+                'expectedAmount' => '20.00',
+                'salesTaxCode' => ['listId' => 'TAX-LIST-1'],
+                'site' => 'Main Site',
+                'lotNumber' => null,
+                'expirationDate' => null,
+                'unitOfMeasure' => null,
+            ]],
+            'expectedSubtotal' => '20.00',
+            'expectedTax' => null,
+            'expectedTotal' => null,
+        ],
+    ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    $submit = server_test_request(
+        'http://127.0.0.1:8765/submit',
+        $submitBody,
+        $requestId,
+        'submit',
+        $secret
+    );
+    $submitData = json_decode($submit['body'], true, 16, JSON_THROW_ON_ERROR);
+    server_test_assert(
+        $submit['status'] === 503
+            && server_test_verify_response($submit, $requestId, $secret)
+            && ($submitData['status'] ?? null) === 'error'
+            && ($submitData['diagnosticCode'] ?? null) === 'WRITE_DISABLED'
+            && ($submitData['outcome'] ?? null) === 'rejected'
+            && !array_key_exists('accepted', $submitData),
+        'valid submission remains blocked by the disabled bridge flag with a signed no-write result'
+    );
+
+    $requestId = qb_export_uuid();
     $body = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $wrongContentType = server_test_request(
         'http://127.0.0.1:8765/health',
@@ -235,10 +293,11 @@ try {
     server_test_assert($wrongContentType['status'] === 400, 'bridge rejects unexpected content types');
 
     $oversizedBody = str_repeat('x', 524289);
+    $requestId = qb_export_uuid();
     $oversized = server_test_request(
         'http://127.0.0.1:8765/health',
         $oversizedBody,
-        '77777777-7777-4777-8777-777777777777',
+        $requestId,
         'health',
         $secret
     );

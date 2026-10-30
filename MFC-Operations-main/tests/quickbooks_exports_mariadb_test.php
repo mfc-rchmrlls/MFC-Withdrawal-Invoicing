@@ -88,6 +88,14 @@ try {
          (reference_type,local_key,qb_list_id,verified_at,verified_by,active)
          VALUES('customer','client:77','LEGACY-LIST',CURRENT_TIMESTAMP,1,1)"
     );
+    $first->exec(
+        "INSERT INTO qb_exports(export_id,transaction_type,source_transaction_id,source_revision,snapshot_json,created_by)
+         VALUES('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','invoice',99,REPEAT('a',64),'{}',1)"
+    );
+    $first->exec(
+        "INSERT INTO qb_export_attempts(export_id,attempt_number,request_id,outcome,started_at)
+         VALUES('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',1,'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','validation_only',CURRENT_TIMESTAMP)"
+    );
     $hardeningPath = __DIR__ . '/../backend/database/migrations/20261023_typed_qb_exports_hardening.sql';
     $hardening = file_get_contents($hardeningPath);
     if (!is_string($hardening)) {
@@ -97,10 +105,24 @@ try {
     foreach (preg_split('/;\s*/', $hardening, -1, PREG_SPLIT_NO_EMPTY) as $statement) {
         $first->exec(trim($statement));
     }
+    foreach (preg_split('/;\s*/', $hardening, -1, PREG_SPLIT_NO_EMPTY) as $statement) {
+        $first->exec(trim($statement));
+    }
     $legacyVerification = $first->query(
         "SELECT active,evidence_hmac FROM qb_export_reference_verifications WHERE local_key='client:77'"
     )->fetch();
     maria_assert((int)$legacyVerification['active'] === 1 && $legacyVerification['evidence_hmac'] === null, 'hardening preserves legacy verification rows without letting them gain signed approval');
+    $hardenedColumns = $first->query(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='qb_export_reference_verifications'
+         AND COLUMN_NAME IN ('company_file_fingerprint','diagnostic_request_id','evidence_hmac')"
+    )->fetchColumn();
+    maria_assert((int)$hardenedColumns === 3, 'hardening adds all signed-evidence columns and can be safely rerun');
+    maria_assert(
+        (int)$first->query("SELECT COUNT(*) FROM qb_exports WHERE export_id='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'")->fetchColumn() === 1
+            && (int)$first->query("SELECT COUNT(*) FROM qb_export_attempts WHERE request_id='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'")->fetchColumn() === 1,
+        'hardening preserves existing export and attempt history'
+    );
 
     $expectedTables = ['qb_export_reference_verifications', 'qb_exports', 'qb_export_events', 'qb_export_attempts'];
     foreach ($expectedTables as $table) {
@@ -171,6 +193,34 @@ try {
     );
     maria_assert((int)$first->query('SELECT COUNT(*) FROM qb_exports WHERE source_transaction_id=202')->fetchColumn() === 1, 'concurrent queue creation leaves exactly one export');
 
+    $contendedExport = '77777777-7777-4777-8777-777777777777';
+    $first->prepare(
+        'INSERT INTO qb_exports(export_id,transaction_type,source_transaction_id,source_revision,snapshot_json,created_by)
+         VALUES(?,?,?,?,?,?)'
+    )->execute([$contendedExport, 'invoice', 303, str_repeat('e', 64), '{}', 1]);
+    $first->beginTransaction();
+    $contendedClaimToken = qb_export_uuid();
+    maria_assert(
+        qb_export_claim($first, $contendedExport, str_repeat('e', 64), $contendedClaimToken),
+        'first concurrent posting request claims the pending export'
+    );
+    $second->beginTransaction();
+    $secondClaimFailedOnLock = false;
+    try {
+        qb_export_claim($second, $contendedExport, str_repeat('e', 64), qb_export_uuid());
+    } catch (PDOException) {
+        $secondClaimFailedOnLock = true;
+    }
+    if ($second->inTransaction()) {
+        $second->rollBack();
+    }
+    $first->commit();
+    maria_assert($secondClaimFailedOnLock, 'second simultaneous posting request cannot pass the in-flight InnoDB claim');
+    maria_assert(
+        !qb_export_claim($second, $contendedExport, str_repeat('e', 64), qb_export_uuid()),
+        'contending request remains unable to claim after the first commit'
+    );
+
     $claimToken = qb_export_uuid();
     maria_assert(qb_export_claim($first, '11111111-1111-4111-8111-111111111111', str_repeat('a', 64), $claimToken), 'queue claim atomically transitions pending to processing');
     $first->exec("UPDATE qb_exports SET lease_until=DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 SECOND) WHERE export_id='11111111-1111-4111-8111-111111111111'");
@@ -179,7 +229,7 @@ try {
     qb_export_record_attempt($first, '11111111-1111-4111-8111-111111111111', 1, $requestId, 'unknown', 'OUTCOME_UNKNOWN', 'No response received');
     maria_assert(qb_export_transition($first, '11111111-1111-4111-8111-111111111111', $claimToken, 'processing', 'unknown', null, null, null, $requestId, 'OUTCOME_UNKNOWN'), 'queue transition writes unknown outcome and state audit event');
     maria_assert(!qb_export_claim($first, '11111111-1111-4111-8111-111111111111', str_repeat('a', 64), qb_export_uuid()), 'unknown export cannot be reclaimed after an expired or ambiguous attempt');
-    maria_assert((int)$first->query('SELECT COUNT(*) FROM qb_export_events')->fetchColumn() === 2, 'claim and terminal state changes are both auditable');
+    maria_assert((int)$first->query("SELECT COUNT(*) FROM qb_export_events WHERE export_id='11111111-1111-4111-8111-111111111111'")->fetchColumn() === 2, 'claim and terminal state changes are both auditable');
 
     $legacy = $first->query('SELECT marker FROM qb_jobs WHERE invoice_id=9')->fetchColumn();
     maria_assert($legacy === 'legacy-history', 'legacy qb_jobs schema and history remain unchanged by migration');

@@ -9,13 +9,21 @@ $page = filter_input(INPUT_GET, 'page', FILTER_VALIDATE_INT, ['options' => ['min
 $clientId = $clientId ?: 0;
 $page = $page ?: 1;
 $perPage = 10;
-if (!$clientId) { http_response_code(400); echo json_encode(['error' => 'Invalid client.']); exit; }
+if (!$clientId) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Invalid client.']);
+    exit;
+}
 
 try {
     $pdo = db();
     $exists = $pdo->prepare('SELECT 1 FROM clients WHERE id=?');
     $exists->execute([$clientId]);
-    if (!$exists->fetchColumn()) { http_response_code(404); echo json_encode(['error' => 'Client not found.']); exit; }
+    if (!$exists->fetchColumn()) {
+        http_response_code(404);
+        echo json_encode(['error' => 'Client not found.']);
+        exit;
+    }
 
     $count = $pdo->prepare('SELECT COUNT(*) FROM invoices WHERE customer_id=?');
     $count->execute([$clientId]);

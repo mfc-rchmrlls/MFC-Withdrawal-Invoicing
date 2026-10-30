@@ -92,7 +92,7 @@ $total = array_sum(array_map(static fn(array $line): float => (float)$line['amou
     </div>
     <div class="toolbar"><a href="withdrawals.php" class="btn btn-light"><i class="bi bi-arrow-left" aria-hidden="true"></i> Select withdrawal</a></div>
 </div>
-<div class="notice warning mb-3"><strong>Local preparation only:</strong> this Sales Order is saved in this application. QuickBooks submission and live customer/item mapping validation are not available. CLASS, STATUS, FULFILLED QUANTITY, and TAX are retained as local preparation values and are not verified QuickBooks mappings.</div>
+<!-- <div class="notice warning mb-3"><strong>Local preparation only:</strong> this Sales Order is saved in this application. QuickBooks submission and live customer/item mapping validation are not available. CLASS, STATUS, FULFILLED QUANTITY, and TAX are retained as local preparation values and are not verified QuickBooks mappings.</div> -->
 <?php $notice = take_flash();
 if ($notice): ?><div class="alert alert-<?= e($notice['type']) ?>" role="status"><?= e($notice['message']) ?></div><?php endif; ?>
 <form method="post" action="<?= e(APP_BASE_URL) ?>/backend/controllers/sales_order_save.php" id="salesOrderForm">
@@ -171,7 +171,7 @@ if ($notice): ?><div class="alert alert-<?= e($notice['type']) ?>" role="status"
                                 </select></td>
                             <td><input class="form-control form-control-sm" type="number" min="1" step="1" name="items[<?= $index ?>][ordered_quantity]" aria-label="Line <?= $index + 1 ?> ordered quantity" value="<?= e($line['ordered_quantity']) ?>" required></td>
                             <td><input class="form-control form-control-sm" name="items[<?= $index ?>][lot_number]" maxlength="100" aria-label="Line <?= $index + 1 ?> lot number" value="<?= e($line['lot_number'] ?? '') ?>"></td>
-                            <td><input class="form-control form-control-sm" name="items[<?= $index ?>][u_m]" maxlength="40" aria-label="Line <?= $index + 1 ?> unit of measure" value="<?= e($line['u_m'] ?? '') ?>"></td>
+                            <td><input class="form-control form-control-sm" name="items[<?= $index ?>][u_m]" maxlength="40" aria-label="Line <?= $index + 1 ?> unit of measure" value="<?= e($line['u_m'] ?? '') ?>" readonly></td>
                             <td>
                                 <div class="input-group input-group-sm"><span class="input-group-text">&#8369;</span><input class="form-control currency-input so-rate" type="text" inputmode="decimal" name="items[<?= $index ?>][rate]" aria-label="Line <?= $index + 1 ?> rate" value="<?= $line['rate'] === null ? '' : number_format((float)$line['rate'], 2, '.', ',') ?>" required></div>
                             </td>
@@ -211,7 +211,7 @@ if ($notice): ?><div class="alert alert-<?= e($notice['type']) ?>" role="status"
             </select></td>
         <td><input class="form-control form-control-sm" type="number" min="1" step="1" data-field="ordered_quantity" value="1" required></td>
         <td><input class="form-control form-control-sm" data-field="lot_number" maxlength="100"></td>
-        <td><input class="form-control form-control-sm" data-field="u_m" maxlength="40"></td>
+        <td><input class="form-control form-control-sm" data-field="u_m" maxlength="40" readonly></td>
         <td>
             <div class="input-group input-group-sm"><span class="input-group-text">&#8369;</span><input class="form-control currency-input so-rate" type="text" inputmode="decimal" data-field="rate" required></div>
         </td>
@@ -286,7 +286,7 @@ if ($notice): ?><div class="alert alert-<?= e($notice['type']) ?>" role="status"
             const row = event.target.closest('tr'),
                 previous = row.dataset.previousProduct || '',
                 option = event.target.selectedOptions[0];
-            const hasEdits = ['[name$="[description]"]', '[name$="[u_m]"]', '.so-rate'].some(selector => (row.querySelector(selector)?.value || '').trim() !== '');
+            const hasEdits = ['[name$="[description]"]', '.so-rate'].some(selector => (row.querySelector(selector)?.value || '').trim() !== '');
             if (previous !== event.target.value && hasEdits && !confirm('Changing ITEM will replace DESCRIPTION, U/M, and RATE with the selected product defaults. Continue?')) {
                 event.target.value = previous;
                 return;

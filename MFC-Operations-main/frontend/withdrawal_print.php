@@ -502,13 +502,13 @@ $itemCount = count($items);
                         src="<?= e($logoUrl) ?>"
                         alt="Hightower Storage and Trading Centre, Inc.">
 
-                    
+
                     <!--<div class="company-details">
                         Address: 502-A Carlos Palanca Sr. St., Quiapo, Manila<br>
                         Tel No.: (02) 5310-1181 | (02) 5310-1182 | (02) 5310-1163<br>
                         Email: htstorage2012@gmail.com
                     </div>-->
-                    
+
                 </td>
 
                 <td colspan="2" class="form-title">

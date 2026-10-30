@@ -80,6 +80,24 @@ function get_products(PDO $pdo): array
     return $pdo->query('SELECT id,product_name,ht_code,qb_code,ht_description,qb_description,item_code,description,u_m,default_price,kg_per_box,qb_list_id,active FROM products WHERE active=1 ORDER BY product_name')->fetchAll();
 }
 
+function product_codes_match(mixed $itemCode, mixed $qbCode): bool
+{
+    if ($itemCode === null || $qbCode === null) {
+        return $itemCode === $qbCode;
+    }
+    if (!is_string($itemCode) || !is_string($qbCode)) {
+        return false;
+    }
+
+    $itemCode = trim($itemCode);
+    $qbCode = trim($qbCode);
+    if ($itemCode === '' || $qbCode === '') {
+        return $itemCode === $qbCode;
+    }
+
+    return strcasecmp($itemCode, $qbCode) === 0;
+}
+
 function withdrawal_product_label(string $name, ?string $description): string
 {
     $name = trim($name);

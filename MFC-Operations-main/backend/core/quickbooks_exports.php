@@ -42,10 +42,26 @@ function qb_export_reference(PDO $pdo, string $type, string $localKey, ?string $
 {
     $secret = getenv('WQ_QB_VERIFICATION_SECRET') ?: '';
     $companyFingerprint = strtolower(getenv('WQ_QB_COMPANY_FINGERPRINT') ?: '');
-    if (strlen($secret) < 32
+    if (
+        strlen($secret) < 32
         || !preg_match('/^[a-f0-9]{64}$/D', $companyFingerprint)
-        || ($type !== 'tax_code' && ($listId === null || trim($listId) === ''))) {
+    ) {
         return null;
+    }
+
+    $requestedListId = $listId === null ? null : trim((string)$listId);
+    if ($requestedListId === '') {
+        $requestedListId = null;
+    }
+
+    $localListId = null;
+    if (preg_match('/^(client|product):(\d+)$/D', $localKey, $localMatches)) {
+        $localTable = $localMatches[1] === 'client' ? 'clients' : 'products';
+        $localId = (int)$localMatches[2];
+        $localQuery = $pdo->prepare('SELECT qb_list_id FROM ' . $localTable . ' WHERE id=?');
+        $localQuery->execute([$localId]);
+        $localRecord = $localQuery->fetch(PDO::FETCH_ASSOC);
+        $localListId = trim((string)($localRecord['qb_list_id'] ?? ''));
     }
 
     $query = $pdo->prepare(
@@ -58,19 +74,35 @@ function qb_export_reference(PDO $pdo, string $type, string $localKey, ?string $
     );
     $query->execute([$type, $localKey]);
     $mapping = $query->fetch();
-    if (!$mapping
-        || ($listId !== null && !hash_equals((string)$mapping['qb_list_id'], trim($listId)))
-        || !preg_match('/^[a-f0-9]{64}$/D', (string)$mapping['company_file_fingerprint'])
-        || !qb_export_verification_is_current($mapping, $companyFingerprint)
-        || !preg_match('/^[a-f0-9-]{36}$/iD', (string)$mapping['diagnostic_request_id'])
-        || !preg_match('/^[a-f0-9]{64}$/D', (string)$mapping['evidence_hmac'])
-        || !hash_equals(
-            qb_export_verification_signature($mapping, $secret),
-            (string)$mapping['evidence_hmac']
-        )) {
+    if (
+        $mapping
+        && $requestedListId !== null
+        && !hash_equals((string)$mapping['qb_list_id'], $requestedListId)
+    ) {
         return null;
     }
-    return $mapping;
+    $preferStoredVerification = $mapping && (
+        $requestedListId === null
+        ? $localListId !== ''
+        : hash_equals((string)$mapping['qb_list_id'], $requestedListId)
+    );
+    if ($mapping && $preferStoredVerification) {
+        if (
+            !preg_match('/^[a-f0-9]{64}$/D', (string)$mapping['company_file_fingerprint'])
+            || !qb_export_verification_is_current($mapping, $companyFingerprint)
+            || !preg_match('/^[a-f0-9-]{36}$/iD', (string)$mapping['diagnostic_request_id'])
+            || !preg_match('/^[a-f0-9]{64}$/D', (string)$mapping['evidence_hmac'])
+            || !hash_equals(
+                qb_export_verification_signature($mapping, $secret),
+                (string)$mapping['evidence_hmac']
+            )
+        ) {
+            return null;
+        }
+        return $mapping;
+    }
+
+    return null;
 }
 
 function qb_export_verification_signature(array $mapping, string $secret): string
@@ -97,6 +129,184 @@ function qb_export_verification_is_current(array $mapping, string $expectedFinge
         && ($dateErrors === false || ($dateErrors['warning_count'] === 0 && $dateErrors['error_count'] === 0))
         && $verifiedAt <= new DateTimeImmutable()
         && hash_equals($expectedFingerprint, strtolower((string)($mapping['company_file_fingerprint'] ?? '')));
+}
+
+function qb_export_name_candidate_status(string $type, array $searchNames, array $record): string
+{
+    if (
+        !in_array($type, ['customer', 'item'], true)
+        || !$searchNames
+        || !is_string($record['name'] ?? null)
+        || !is_string($record['listId'] ?? null)
+        || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId'])
+        || !is_string($record['fullName'] ?? null)
+        || trim($record['fullName']) === ''
+    ) {
+        return 'identity_mismatch';
+    }
+    $nameFields = $type === 'customer'
+        ? ['name' => $record['name']]
+        : ['name' => $record['name'], 'fullName' => $record['fullName']];
+    $nameMatched = false;
+    foreach ($nameFields as $value) {
+        if (is_string($value) && in_array($value, $searchNames, true)) {
+            $nameMatched = true;
+            break;
+        }
+    }
+    if (!$nameMatched) {
+        return 'name_mismatch';
+    }
+    if (($record['active'] ?? null) === false) {
+        return 'inactive';
+    }
+    if (($record['active'] ?? null) !== true) {
+        return 'active_status_unknown';
+    }
+    return $type === 'item' ? 'item_code_source_unverified' : 'verified_candidate';
+}
+
+function qb_export_name_candidate_summary(string $type, array $searchNames, array $records): array
+{
+    $matches = [];
+    $diagnosticMatches = [];
+    foreach ($records as $record) {
+        if (!is_array($record)) {
+            continue;
+        }
+        $status = qb_export_name_candidate_status($type, $searchNames, $record);
+        if ($status !== 'name_mismatch' && $status !== 'identity_mismatch') {
+            $diagnosticMatches[] = ['record' => $record, 'status' => $status];
+        }
+        if ($status === 'verified_candidate') {
+            $matches[] = $record;
+        }
+    }
+    if ($type === 'item') {
+        $itemStatus = count($diagnosticMatches) === 0
+            ? (count($records) === 0 ? 'not_found_by_name' : 'name_mismatch')
+            : (count($diagnosticMatches) > 1
+                ? 'ambiguous_name_candidates'
+                : ($diagnosticMatches[0]['status'] === 'inactive'
+                    ? 'inactive_name_candidate'
+                    : ($diagnosticMatches[0]['status'] === 'active_status_unknown'
+                        ? 'active_status_unknown'
+                        : 'item_code_source_unverified')));
+        return [
+            'status' => $itemStatus,
+            'matches' => [],
+            'diagnostic_matches' => $diagnosticMatches,
+            'candidate' => null,
+        ];
+    }
+    return [
+        'status' => count($records) === 0
+            ? 'not_found'
+            : (count($matches) > 1
+                ? 'ambiguous'
+                : (count($matches) === 1 ? 'candidate_found' : 'business_field_mismatch')),
+        'matches' => $matches,
+        'diagnostic_matches' => $diagnosticMatches,
+        'candidate' => count($matches) === 1 ? $matches[0] : null,
+    ];
+}
+
+function qb_export_store_reference_verification(PDO $pdo, array $verification): void
+{
+    $type = (string)($verification['reference_type'] ?? '');
+    $localKey = (string)($verification['local_key'] ?? '');
+    $listId = (string)($verification['qb_list_id'] ?? '');
+    $fullName = $verification['qb_full_name'] ?? null;
+    $fingerprint = (string)($verification['company_file_fingerprint'] ?? '');
+    $requestId = (string)($verification['diagnostic_request_id'] ?? '');
+    $secret = getenv('WQ_QB_VERIFICATION_SECRET') ?: '';
+    $localKeyPattern = $type === 'customer' ? '/^client:\d+$/D' : '/^product:\d+$/D';
+    $verifiedAt = is_string($verification['verified_at'] ?? null) ? $verification['verified_at'] : '';
+    $verifiedAtDate = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $verifiedAt);
+    $verifiedAtErrors = DateTimeImmutable::getLastErrors();
+    if (
+        !in_array($type, ['customer', 'item'], true)
+        || !preg_match($localKeyPattern, $localKey)
+        || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $listId)
+        || !is_string($fullName)
+        || trim($fullName) === ''
+        || mb_strlen($fullName) > 255
+        || ($verification['active'] ?? null) !== 1
+        || !preg_match('/^[a-f0-9]{64}$/D', $fingerprint)
+        || !preg_match('/^[a-f0-9-]{36}$/iD', $requestId)
+        || strlen($secret) < 32
+        || $verifiedAtDate === false
+        || ($verifiedAtErrors !== false && ($verifiedAtErrors['warning_count'] !== 0 || $verifiedAtErrors['error_count'] !== 0))
+        || $verifiedAtDate->format('Y-m-d H:i:s') !== $verifiedAt
+        || !is_int($verification['verified_by'] ?? null)
+        || $verification['verified_by'] < 1
+        || !is_string($verification['evidence_hmac'] ?? null)
+        || !hash_equals(qb_export_verification_signature($verification, $secret), $verification['evidence_hmac'])
+    ) {
+        throw new DomainException('The signed QuickBooks reference evidence is invalid.');
+    }
+    if (!$pdo->inTransaction()) {
+        throw new LogicException('Reference verification persistence requires a database transaction.');
+    }
+
+    $lockSuffix = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+    $existingQuery = $pdo->prepare(
+        'SELECT id, local_key FROM qb_export_reference_verifications
+         WHERE reference_type=? AND (local_key=? OR qb_list_id=?)' . $lockSuffix
+    );
+    $existingQuery->execute([$type, $localKey, $listId]);
+    $existing = $existingQuery->fetchAll();
+    foreach ($existing as $row) {
+        if (!hash_equals($localKey, (string)$row['local_key'])) {
+            throw new DomainException('That QuickBooks ListID is already assigned to a different local record.');
+        }
+    }
+    $values = [
+        $listId,
+        $fullName,
+        $verification['verified_at'],
+        $verification['verified_by'],
+        $fingerprint,
+        $requestId,
+        $verification['evidence_hmac'],
+    ];
+    if ($existing) {
+        $save = $pdo->prepare(
+            'UPDATE qb_export_reference_verifications
+             SET qb_list_id=?, qb_full_name=?, verified_at=?, verified_by=?,
+                  company_file_fingerprint=?, diagnostic_request_id=?, evidence_hmac=?, active=1
+             WHERE id=?'
+        );
+        $save->execute(array_merge($values, [(int)$existing[0]['id']]));
+    } else {
+        $save = $pdo->prepare(
+            'INSERT INTO qb_export_reference_verifications
+             (reference_type, local_key, qb_list_id, qb_full_name, verified_at, verified_by,
+               company_file_fingerprint, diagnostic_request_id, evidence_hmac, active)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)'
+        );
+        $save->execute([
+            $type,
+            $localKey,
+            $listId,
+            $fullName,
+            $verification['verified_at'],
+            $verification['verified_by'],
+            $fingerprint,
+            $requestId,
+            $verification['evidence_hmac'],
+        ]);
+    }
+
+    $table = $type === 'customer' ? 'clients' : 'products';
+    $localId = (int)substr($localKey, strpos($localKey, ':') + 1);
+    $update = $pdo->prepare("UPDATE {$table} SET qb_list_id=? WHERE id=? AND active=1");
+    $update->execute([$listId, $localId]);
+    $check = $pdo->prepare("SELECT 1 FROM {$table} WHERE id=? AND active=1 AND qb_list_id=?");
+    $check->execute([$localId, $listId]);
+    if (!$check->fetchColumn()) {
+        throw new DomainException('The local customer or product could not be updated with the verified QuickBooks ListID.');
+    }
 }
 
 function qb_export_load(PDO $pdo, string $type, int $id): ?array
@@ -199,10 +409,10 @@ function qb_export_bridge_request(array $preview): array
             || trim((string)($line['unit_of_measure'] ?? '')) !== ''
             || trim((string)($line['lot_number'] ?? '')) !== ''
             || trim((string)($line['expiration_date'] ?? '')) !== ''
-            || trim((string)($line['item_code'] ?? '')) !== ''
             || trim((string)($line['class_name'] ?? '')) !== ''
             || trim((string)($line['line_status'] ?? '')) !== ''
-            || trim((string)($line['fulfilled_quantity'] ?? '')) !== '') {
+            || trim((string)($line['fulfilled_quantity'] ?? '')) !== ''
+        ) {
             throw new DomainException('A line contains unresolved QuickBooks mappings and cannot be sent to the bridge.');
         }
         $item = ['listId' => $line['item_list_id'] ?? null];
@@ -225,6 +435,78 @@ function qb_export_bridge_request(array $preview): array
         'idempotencyKey' => null,
         'transactionType' => $transaction['transaction_type'],
         'source' => ['id' => $transaction['source_id'], 'revision' => $preview['source_revision']],
+        'transaction' => [
+            'customer' => ['listId' => $transaction['customer_list_id']],
+            'txnDate' => $transaction['transaction_date'],
+            'refNumber' => $transaction['reference_number'],
+            'poNumber' => $transaction['po_number'],
+            'memo' => $transaction['memo'],
+            'lines' => $lines,
+            'expectedSubtotal' => $transaction['expected_subtotal'],
+            'expectedTax' => null,
+            'expectedTotal' => null,
+        ],
+    ];
+}
+
+function qb_export_submit_bridge_request(array $preview, string $exportId, string $idempotencyKey): array
+{
+    $transaction = $preview['transaction'] ?? null;
+    if (
+        ($preview['valid'] ?? false) !== true
+        || !empty($preview['errors'])
+        || !is_array($transaction)
+        || ($transaction['transaction_type'] ?? null) !== 'invoice'
+        || !preg_match('/^[a-f0-9-]{36}$/iD', $exportId)
+        || !preg_match('/^[a-f0-9]{64}$/D', $idempotencyKey)
+    ) {
+        throw new DomainException('A fully validated persisted invoice snapshot is required for QuickBooks posting.');
+    }
+
+    $lines = [];
+    foreach ($transaction['lines'] ?? [] as $line) {
+        if (
+            !is_array($line)
+            || ($line['item_mapping_status'] ?? null) !== 'locally recorded; current company check required'
+            || ($line['tax_mapping_status'] ?? null) !== 'locally recorded; current company check required'
+            || trim((string)($line['site'] ?? '')) === ''
+            || mb_strlen((string)$line['site']) > 31
+            || trim((string)($line['expiration_date'] ?? '')) !== ''
+        ) {
+            throw new DomainException('The persisted invoice contains a reference or line value that has not passed posting preflight.');
+        }
+        $lines[] = [
+            'item' => ['listId' => $line['item_list_id'] ?? null],
+            'description' => $line['description'] ?? null,
+            'quantity' => $line['quantity'] ?? null,
+            'rate' => $line['rate'] ?? null,
+            'expectedAmount' => $line['expected_amount'] ?? null,
+            'salesTaxCode' => ['listId' => $line['tax_list_id'] ?? null],
+            'site' => $line['site'],
+            'lotNumber' => $line['lot_number'] ?? null,
+            'expirationDate' => null,
+            'unitOfMeasure' => $line['unit_of_measure'] ?? null,
+        ];
+    }
+
+    if (
+        !is_string($transaction['customer_list_id'] ?? null)
+        || trim($transaction['customer_list_id']) === ''
+        || !preg_match('/^[a-f0-9]{64}$/D', (string)($preview['source_revision'] ?? ''))
+    ) {
+        throw new DomainException('The persisted invoice snapshot is missing its verified customer or source revision.');
+    }
+
+    return [
+        'protocolVersion' => '1',
+        'requestId' => qb_export_uuid(),
+        'operation' => 'submit',
+        'transactionType' => 'invoice',
+        'idempotencyKey' => $idempotencyKey,
+        'source' => [
+            'id' => (int)$transaction['source_id'],
+            'revision' => $preview['source_revision'],
+        ],
         'transaction' => [
             'customer' => ['listId' => $transaction['customer_list_id']],
             'txnDate' => $transaction['transaction_date'],
@@ -287,8 +569,10 @@ function qb_export_validate(PDO $pdo, string $type, int $id, ?string $excludeExp
     if (!$customerMapping) {
         $addError('CUSTOMER_MAPPING_UNVERIFIED', 'customer.listId', 'A current, active QuickBooks customer ListID verification is required. Names are not used as a fallback.');
     }
-    if ($type === 'sales_order'
-        && trim((string)($transaction['customer_list_snapshot'] ?? '')) !== trim((string)($transaction['customer_list_id'] ?? ''))) {
+    if (
+        $type === 'sales_order'
+        && trim((string)($transaction['customer_list_snapshot'] ?? '')) !== trim((string)($transaction['customer_list_id'] ?? ''))
+    ) {
         $addError('CUSTOMER_MAPPING_STALE', 'customer.listId', 'The sales-order customer mapping snapshot differs from the current customer mapping.');
     }
     if (!qb_export_valid_date((string)$transaction['transaction_date'])) {
@@ -297,10 +581,24 @@ function qb_export_validate(PDO $pdo, string $type, int $id, ?string $excludeExp
     if (trim((string)($transaction['reference_number'] ?? '')) === '') {
         $addError('REFERENCE_NUMBER_MISSING', 'referenceNumber', 'A local invoice or sales-order reference number is required.');
     }
+    if (
+        $type === 'invoice'
+        && mb_strlen((string)($transaction['reference_number'] ?? '')) > 11
+    ) {
+        $addError('REFERENCE_NUMBER_TOO_LONG', 'referenceNumber', 'QuickBooks Desktop RefNumber supports at most 11 characters; the source number must not be truncated or rewritten.');
+    }
+    if ($type === 'invoice' && mb_strlen((string)($transaction['po_no'] ?? '')) > 25) {
+        $addError('PO_NUMBER_TOO_LONG', 'poNumber', 'QuickBooks Desktop PONumber supports at most 25 characters.');
+    }
+    if ($type === 'invoice' && mb_strlen((string)($transaction['memo'] ?? '')) > 4095) {
+        $addError('MEMO_TOO_LONG', 'memo', 'QuickBooks Desktop invoice Memo supports at most 4095 characters.');
+    }
     if (!$transaction['lines']) {
         $addError('LINES_MISSING', 'lines', 'At least one transaction line is required.');
     }
-    $addError('TAX_TOTAL_UNRESOLVED', 'taxTotal', 'The application does not calculate QuickBooks sales tax or a reconciled transaction total.');
+    if ($type === 'sales_order') {
+        $addError('TAX_TOTAL_UNRESOLVED', 'taxTotal', 'The application does not calculate QuickBooks sales tax or a reconciled transaction total.');
+    }
 
     $previewLines = [];
     $subtotalCents = 0;
@@ -358,8 +656,10 @@ function qb_export_validate(PDO $pdo, string $type, int $id, ?string $excludeExp
         if (!$itemMapping) {
             $addError('ITEM_MAPPING_UNVERIFIED', $path . '.item.listId', 'A current, active QuickBooks item ListID verification is required. QB Code and names are not fallbacks.');
         }
-        if ($type === 'sales_order'
-            && trim((string)($line['item_list_snapshot'] ?? '')) !== $itemListId) {
+        if (
+            $type === 'sales_order'
+            && trim((string)($line['item_list_snapshot'] ?? '')) !== $itemListId
+        ) {
             $addError('ITEM_MAPPING_STALE', $path . '.item.listId', 'The sales-order item mapping snapshot differs from the current Product Master mapping.');
         }
 
@@ -372,13 +672,25 @@ function qb_export_validate(PDO $pdo, string $type, int $id, ?string $excludeExp
         if ($siteId < 1 || (int)($line['site_active'] ?? 0) !== 1) {
             $addError('SITE_REQUIRED', $path . '.site', 'Each line must reference an active local Site.');
         }
-        $addError('SITE_DESTINATION_UNVERIFIED', $path . '.site', 'The QuickBooks destination for the local Site is unresolved; no Site value will be discarded.');
+        if ($type === 'invoice' && mb_strlen((string)($line['site_name'] ?? '')) > 31) {
+            $addError('SITE_NAME_TOO_LONG', $path . '.site', 'QuickBooks Desktop InventorySiteRef supports at most 31 characters.');
+        }
+        if ($type === 'sales_order') {
+            $addError('SITE_DESTINATION_UNVERIFIED', $path . '.site', 'The QuickBooks destination for the local Site is unresolved; no Site value will be discarded.');
+        }
 
         $unit = trim((string)($line['u_m'] ?? ''));
-        if ($unit !== '') {
+        if ($type === 'invoice' && mb_strlen($unit) > 31) {
+            $addError('UNIT_OF_MEASURE_TOO_LONG', $path . '.unitOfMeasure', 'QuickBooks Desktop UnitOfMeasure supports at most 31 characters.');
+        }
+        if ($unit !== '' && $type === 'sales_order') {
             $addError('UNIT_DESTINATION_UNVERIFIED', $path . '.unitOfMeasure', 'The local U/M value has no verified QuickBooks unit mapping.');
         }
-        if (trim((string)($line['lot_number'] ?? '')) !== '') {
+        $lotNumber = trim((string)($line['lot_number'] ?? ''));
+        if ($type === 'invoice' && mb_strlen($lotNumber) > 40) {
+            $addError('LOT_NUMBER_TOO_LONG', $path . '.lotNumber', 'QuickBooks Desktop InvoiceLineAdd LotNumber supports at most 40 characters; the value must not be truncated.');
+        }
+        if ($lotNumber !== '' && $type === 'sales_order') {
             $addError('LOT_DESTINATION_UNVERIFIED', $path . '.lotNumber', 'Lot Number support and destination are not verified; the value will not be silently omitted.');
         }
         if (trim((string)($line['expiration_date'] ?? '')) !== '') {
@@ -387,14 +699,16 @@ function qb_export_validate(PDO $pdo, string $type, int $id, ?string $excludeExp
             }
             $addError('EXPIRATION_DESTINATION_UNVERIFIED', $path . '.expirationDate', 'Expiration Date support and destination are not verified; the value will not be silently omitted.');
         }
-        if (trim((string)($line['item_code'] ?? '')) !== '') {
+        if ($type === 'sales_order' && trim((string)($line['item_code'] ?? '')) !== '') {
             $addError('ITEM_CODE_DESTINATION_UNVERIFIED', $path . '.itemCode', 'The local item code is not a QuickBooks ListID and has no verified writable destination.');
         }
-        foreach ([
-            'class_name' => ['CLASS_DESTINATION_UNVERIFIED', 'class'],
-            'line_status' => ['LINE_STATUS_DESTINATION_UNVERIFIED', 'lineStatus'],
-            'fulfilled_quantity' => ['FULFILLED_QUANTITY_DESTINATION_UNVERIFIED', 'fulfilledQuantity'],
-        ] as $field => [$code, $destination]) {
+        foreach (
+            [
+                'class_name' => ['CLASS_DESTINATION_UNVERIFIED', 'class'],
+                'line_status' => ['LINE_STATUS_DESTINATION_UNVERIFIED', 'lineStatus'],
+                'fulfilled_quantity' => ['FULFILLED_QUANTITY_DESTINATION_UNVERIFIED', 'fulfilledQuantity'],
+            ] as $field => [$code, $destination]
+        ) {
             if (trim((string)($line[$field] ?? '')) !== '') {
                 $addError($code, $path . '.' . $destination, 'This local Sales Order value has no verified QuickBooks destination.');
             }
@@ -454,7 +768,9 @@ function qb_export_validate(PDO $pdo, string $type, int $id, ?string $excludeExp
         'expected_subtotal' => $subtotalOverflow ? 'exceeds supported precision' : qb_export_money_string($subtotalCents),
         'tax_total' => null,
         'expected_total' => null,
-        'tax_total_status' => 'unresolved: local application does not calculate tax',
+        'tax_total_status' => $type === 'invoice'
+            ? 'QuickBooks calculates tax from the verified line tax codes; tax rules must pass live company preflight'
+            : 'unresolved: local application does not calculate tax',
     ];
 
     return [
@@ -492,8 +808,10 @@ function qb_export_create(PDO $pdo, string $type, int $id, string $expectedRevis
             throw new DomainException('The transaction changed after its preview. Refresh and review it again.');
         }
         $finalValidation = qb_export_validate($pdo, $type, $id);
-        if (!$finalValidation['valid']
-            || !hash_equals($validation['source_revision'], (string)$finalValidation['source_revision'])) {
+        if (
+            !$finalValidation['valid']
+            || !hash_equals($validation['source_revision'], (string)$finalValidation['source_revision'])
+        ) {
             throw new DomainException('The transaction or its mappings changed during queue creation. Refresh the preview and try again.');
         }
         $existing = $pdo->prepare('SELECT export_id, status FROM qb_exports WHERE transaction_type=? AND source_transaction_id=?');
@@ -694,18 +1012,15 @@ function qb_export_record_attempt(
     string $diagnosticMessage
 ): void {
     $allowedOutcomes = ['validation_only', 'bridge_unavailable', 'dispatched', 'succeeded', 'rejected', 'unknown'];
-    if ($attemptNumber < 1
+    if (
+        $attemptNumber < 1
         || !preg_match('/^[a-f0-9-]{36}$/iD', $requestId)
-        || !in_array($outcome, $allowedOutcomes, true)) {
+        || !in_array($outcome, $allowedOutcomes, true)
+    ) {
         throw new InvalidArgumentException('Unsupported export attempt outcome.');
     }
     $diagnosticCode = preg_match('/^[A-Z0-9_]{1,80}$/D', $diagnosticCode) ? $diagnosticCode : 'UNCLASSIFIED';
-    $message = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $diagnosticMessage) ?? '';
-    if (preg_match('/<\?xml\b|<QBXML\b/i', $message)) {
-        $message = 'QuickBooks XML details omitted from diagnostics.';
-    }
-    $message = preg_replace('/\b(authorization|signature|secret|token|password|api[-_ ]?key)\b\s*[:=]\s*\S+/i', '$1=[REDACTED]', $message) ?? '';
-    $message = mb_substr(trim($message), 0, 500);
+    $message = qb_export_sanitize_diagnostic($diagnosticMessage);
     $ownsTransaction = !$pdo->inTransaction();
     if ($ownsTransaction) {
         $pdo->beginTransaction();
@@ -726,10 +1041,11 @@ function qb_export_record_attempt(
         if (!in_array($outcome, $allowedForStatus, true)) {
             throw new DomainException('This attempt outcome is not permitted for the current export state.');
         }
+        $completedAt = $outcome === 'dispatched' ? 'NULL' : 'CURRENT_TIMESTAMP';
         $insert = $pdo->prepare(
             'INSERT INTO qb_export_attempts
              (export_id, attempt_number, request_id, outcome, started_at, completed_at, diagnostic_code, diagnostic_message)
-             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)'
+             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ' . $completedAt . ', ?, ?)'
         );
         $insert->execute([$exportId, $attemptNumber, $requestId, $outcome, $diagnosticCode ?: null, $message ?: null]);
         $update = $pdo->prepare('UPDATE qb_exports SET attempt_count=attempt_count+1, updated_at=CURRENT_TIMESTAMP WHERE export_id=?');
@@ -748,12 +1064,56 @@ function qb_export_record_attempt(
     }
 }
 
+function qb_export_sanitize_diagnostic(string $message): string
+{
+    $message = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $message) ?? '';
+    if (preg_match('/<\?xml\b|<QBXML\b/i', $message)) {
+        return 'QuickBooks XML details omitted from diagnostics.';
+    }
+    $message = preg_replace('/\b(authorization|signature|secret|token|password|api[-_ ]?key)\b\s*[:=]\s*\S+/i', '$1=[REDACTED]', $message) ?? '';
+    return mb_substr(trim($message), 0, 500);
+}
+
+function qb_export_finish_attempt(
+    PDO $pdo,
+    string $exportId,
+    int $attemptNumber,
+    string $requestId,
+    string $outcome,
+    string $diagnosticCode,
+    string $diagnosticMessage
+): void {
+    if (!in_array($outcome, ['succeeded', 'rejected', 'unknown'], true)) {
+        throw new InvalidArgumentException('Unsupported terminal export attempt outcome.');
+    }
+    $diagnosticCode = preg_match('/^[A-Z0-9_]{1,80}$/D', $diagnosticCode) ? $diagnosticCode : 'UNCLASSIFIED';
+    $message = qb_export_sanitize_diagnostic($diagnosticMessage);
+    $update = $pdo->prepare(
+        "UPDATE qb_export_attempts
+         SET outcome=?,completed_at=CURRENT_TIMESTAMP,diagnostic_code=?,diagnostic_message=?
+         WHERE export_id=? AND attempt_number=? AND request_id=? AND outcome='dispatched' AND completed_at IS NULL"
+    );
+    $update->execute([
+        $outcome,
+        $diagnosticCode ?: null,
+        $message ?: null,
+        $exportId,
+        $attemptNumber,
+        $requestId,
+    ]);
+    if ($update->rowCount() !== 1) {
+        throw new DomainException('The durable dispatch record is missing or already finalized.');
+    }
+}
+
 function qb_export_claim(PDO $pdo, string $exportId, string $revision, string $claimToken): bool
 {
-    if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) !== 'mysql'
+    if (
+        !in_array($pdo->getAttribute(PDO::ATTR_DRIVER_NAME), ['mysql', 'sqlite'], true)
         || !preg_match('/^[a-f0-9-]{36}$/iD', $exportId)
         || !preg_match('/^[a-f0-9]{64}$/D', $revision)
-        || !preg_match('/^[a-f0-9-]{36}$/iD', $claimToken)) {
+        || !preg_match('/^[a-f0-9-]{36}$/iD', $claimToken)
+    ) {
         throw new InvalidArgumentException('Invalid export claim data or database driver.');
     }
     $ownsTransaction = !$pdo->inTransaction();
@@ -761,9 +1121,13 @@ function qb_export_claim(PDO $pdo, string $exportId, string $revision, string $c
         $pdo->beginTransaction();
     }
     try {
+        $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+        $lease = $driver === 'mysql'
+            ? 'DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 120 SECOND)'
+            : "datetime('now','+120 seconds')";
         $claim = $pdo->prepare(
             "UPDATE qb_exports
-             SET status='processing', claim_token=?, lease_until=DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 120 SECOND)
+             SET status='processing', claim_token=?, lease_until={$lease}
              WHERE export_id=? AND source_revision=? AND status='pending'"
         );
         $claim->execute([$claimToken, $exportId, $revision]);
@@ -831,4 +1195,236 @@ function qb_export_transition(
         }
         throw $error;
     }
+}
+
+function qb_export_post_preflight(PDO $pdo, string $exportId, QuickBooksBridgeClient $bridge): array
+{
+    if (!preg_match('/^[a-f0-9-]{36}$/iD', $exportId)) {
+        return ['ready' => false, 'errors' => [['code' => 'INVALID_EXPORT_ID', 'message' => 'The export identifier is invalid.']]];
+    }
+    $query = $pdo->prepare(
+        'SELECT transaction_type,source_transaction_id,source_revision,snapshot_json,status
+         FROM qb_exports WHERE export_id=?'
+    );
+    $query->execute([$exportId]);
+    $record = $query->fetch();
+    if (!$record) {
+        return ['ready' => false, 'errors' => [['code' => 'EXPORT_NOT_FOUND', 'message' => 'The saved export does not exist.']]];
+    }
+    if ($record['transaction_type'] !== 'invoice' || $record['status'] !== 'pending') {
+        return ['ready' => false, 'errors' => [['code' => 'EXPORT_NOT_POSTABLE', 'message' => 'Only pending invoice exports can be submitted.']]];
+    }
+    try {
+        $snapshot = json_decode((string)$record['snapshot_json'], true, 32, JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        return ['ready' => false, 'errors' => [['code' => 'SNAPSHOT_INVALID', 'message' => 'The immutable invoice snapshot is invalid.']]];
+    }
+    if (
+        !is_array($snapshot)
+        || ($snapshot['transaction_type'] ?? null) !== 'invoice'
+        || (int)($snapshot['source_id'] ?? 0) !== (int)$record['source_transaction_id']
+        || !preg_match('/^[a-f0-9]{64}$/D', (string)$record['source_revision'])
+    ) {
+        return ['ready' => false, 'errors' => [['code' => 'SNAPSHOT_INVALID', 'message' => 'The immutable invoice snapshot does not match its export record.']]];
+    }
+
+    $validation = qb_export_validate($pdo, 'invoice', (int)$record['source_transaction_id'], $exportId);
+    if (
+        !$validation['valid']
+        || !hash_equals((string)$record['source_revision'], (string)$validation['source_revision'])
+        || $snapshot !== $validation['transaction']
+    ) {
+        $errors = $validation['errors'] ?? [];
+        if (!$errors) {
+            $errors[] = ['code' => 'SOURCE_CHANGED', 'path' => 'source', 'message' => 'The saved invoice or approved mappings changed after the snapshot was created.'];
+        }
+        return ['ready' => false, 'errors' => $errors];
+    }
+
+    $idempotencyKey = hash('sha256', "MFC-QB-InvoiceAdd-v1\n" . $exportId . "\n" . $record['source_revision']);
+    $snapshotPreview = [
+        'valid' => true,
+        'errors' => [],
+        'source_revision' => (string)$record['source_revision'],
+        'transaction' => $snapshot,
+    ];
+    try {
+        $request = qb_export_submit_bridge_request($snapshotPreview, $exportId, $idempotencyKey);
+    } catch (Throwable $error) {
+        return ['ready' => false, 'errors' => [['code' => 'SNAPSHOT_NOT_POSTABLE', 'message' => $error->getMessage()]]];
+    }
+
+    $errors = [];
+    if (!QuickBooksBridgeClient::invoiceWriteEnabled()) {
+        $errors[] = ['code' => 'WRITE_DISABLED', 'message' => 'Invoice posting is disabled in the PHP application configuration.'];
+    }
+    $health = $bridge->health();
+    if (
+        !($health['available'] ?? false)
+        || ($health['response']['invoiceWriteEnabled'] ?? false) !== true
+    ) {
+        $errors[] = ['code' => 'BRIDGE_WRITE_DISABLED', 'message' => 'The authenticated local bridge is unavailable or invoice writing is disabled there.'];
+    }
+    $livePreflight = $bridge->preflightInvoice($request['transaction']);
+    foreach ($livePreflight['errors'] ?? [] as $error) {
+        $errors[] = $error;
+    }
+    return [
+        'ready' => $errors === [],
+        'errors' => $errors,
+        'request' => $request,
+        'idempotency_key' => $idempotencyKey,
+        'snapshot' => $snapshot,
+    ];
+}
+
+function qb_export_post(PDO $pdo, string $exportId, int $actorId, ?QuickBooksBridgeClient $bridge = null): array
+{
+    if ($actorId < 1) {
+        throw new DomainException('An active administrator is required to post a QuickBooks invoice.');
+    }
+    $authorization = $pdo->prepare("SELECT 1 FROM employees WHERE id=? AND role='Admin' AND active=1");
+    $authorization->execute([$actorId]);
+    if (!$authorization->fetchColumn()) {
+        throw new DomainException('An active administrator is required to post a QuickBooks invoice.');
+    }
+    $bridge ??= new QuickBooksBridgeClient();
+    $preflight = qb_export_post_preflight($pdo, $exportId, $bridge);
+    if (!($preflight['ready'] ?? false)) {
+        return ['outcome' => 'blocked', 'errors' => $preflight['errors'] ?? []];
+    }
+
+    $request = $preflight['request'];
+    $claimToken = qb_export_uuid();
+    $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    $lockSuffix = $driver === 'mysql' ? ' FOR UPDATE' : '';
+    $pdo->beginTransaction();
+    try {
+        $lookup = $pdo->prepare(
+            'SELECT transaction_type,source_transaction_id,source_revision,status,attempt_count
+             FROM qb_exports WHERE export_id=?' . $lockSuffix
+        );
+        $lookup->execute([$exportId]);
+        $record = $lookup->fetch();
+        if (
+            !$record
+            || $record['status'] !== 'pending'
+            || $record['transaction_type'] !== 'invoice'
+            || !hash_equals((string)$record['source_revision'], (string)$request['source']['revision'])
+        ) {
+            $pdo->rollBack();
+            return ['outcome' => 'blocked', 'errors' => [['code' => 'EXPORT_NOT_PENDING', 'message' => 'This export was already claimed or is no longer pending.']]];
+        }
+        qb_export_lock_source($pdo, 'invoice', (int)$record['source_transaction_id']);
+        $current = qb_export_validate($pdo, 'invoice', (int)$record['source_transaction_id'], $exportId);
+        $storedSnapshot = json_decode((string)$pdo->query(
+            'SELECT snapshot_json FROM qb_exports WHERE export_id=' . $pdo->quote($exportId)
+        )->fetchColumn(), true, 32, JSON_THROW_ON_ERROR);
+        if (
+            !$current['valid']
+            || !hash_equals((string)$record['source_revision'], (string)$current['source_revision'])
+            || $storedSnapshot !== $current['transaction']
+        ) {
+            $pdo->rollBack();
+            return ['outcome' => 'blocked', 'errors' => [['code' => 'SOURCE_CHANGED', 'message' => 'The saved invoice or verified mapping changed during preflight. Refresh and review it again.']]];
+        }
+        if (!qb_export_claim($pdo, $exportId, (string)$record['source_revision'], $claimToken)) {
+            $pdo->rollBack();
+            return ['outcome' => 'blocked', 'errors' => [['code' => 'EXPORT_ALREADY_CLAIMED', 'message' => 'This export was claimed by another submission.']]];
+        }
+        $attemptNumber = (int)$record['attempt_count'] + 1;
+        $requestId = (string)$request['requestId'];
+        qb_export_record_attempt($pdo, $exportId, $attemptNumber, $requestId, 'dispatched', 'DISPATCHED', 'InvoiceAdd request is being sent to the authenticated bridge.');
+        $pdo->commit();
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $error;
+    }
+
+    try {
+        $result = $bridge->submitInvoice($request);
+    } catch (Throwable) {
+        $result = [
+            'outcome' => 'unknown',
+            'request_id' => $request['requestId'],
+            'diagnostic_code' => 'BRIDGE_RESULT_UNCONFIRMED',
+            'message' => 'The bridge result could not be confirmed. Reconcile QuickBooks before any retry.',
+        ];
+    }
+    $outcome = in_array($result['outcome'] ?? null, ['succeeded', 'rejected'], true)
+        ? $result['outcome']
+        : 'unknown';
+    $diagnosticCode = (string)($result['diagnostic_code'] ?? ($outcome === 'succeeded' ? 'CONFIRMED' : 'INVOICE_OUTCOME_UNKNOWN'));
+    $diagnosticMessage = (string)($result['message'] ?? '');
+    $txnId = $outcome === 'succeeded' && is_string($result['txn_id'] ?? null)
+        ? $result['txn_id']
+        : null;
+    if ($outcome === 'succeeded' && $txnId === null) {
+        $outcome = 'unknown';
+        $diagnosticCode = 'SUCCESS_IDENTIFIER_MISSING';
+        $diagnosticMessage = 'QuickBooks may have created the invoice but the transaction identifier was missing. Reconcile before any retry.';
+    }
+    if ($outcome === 'succeeded'
+        && (!is_string($result['company_fingerprint'] ?? null)
+            || !hash_equals(strtolower(getenv('WQ_QB_COMPANY_FINGERPRINT') ?: ''), $result['company_fingerprint']))) {
+        $outcome = 'unknown';
+        $txnId = null;
+        $diagnosticCode = 'COMPANY_IDENTITY_MISMATCH';
+        $diagnosticMessage = 'The signed QuickBooks response did not confirm the configured company identity. Reconcile before any retry.';
+    }
+
+    $pdo->beginTransaction();
+    try {
+        qb_export_finish_attempt($pdo, $exportId, $attemptNumber, $requestId, $outcome, $diagnosticCode, $diagnosticMessage);
+        $referenceNumber = $outcome === 'succeeded'
+            ? (string)($preflight['snapshot']['reference_number'] ?? '')
+            : null;
+        if (!qb_export_transition(
+            $pdo,
+            $exportId,
+            $claimToken,
+            'processing',
+            $outcome,
+            $txnId,
+            $referenceNumber,
+            $actorId,
+            $requestId,
+            $diagnosticCode
+        )) {
+            throw new RuntimeException('The QuickBooks export state could not be finalized.');
+        }
+        $audit = $pdo->prepare(
+            'INSERT INTO activity_logs(employee_id,action,entity_type,entity_id,details,ip_address,created_at)
+             VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)'
+        );
+        $audit->execute([
+            $actorId,
+            'POST_QB_INVOICE',
+            'qb_export',
+            (int)$record['source_transaction_id'],
+            'QuickBooks InvoiceAdd outcome=' . $outcome . '; export=' . $exportId . '; code=' . $diagnosticCode,
+            substr((string)($_SERVER['REMOTE_ADDR'] ?? ''), 0, 45),
+        ]);
+        $pdo->commit();
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        error_log('QuickBooks invoice result persistence failed for export ' . $exportId . ': ' . $error->getMessage());
+        return [
+            'outcome' => 'unknown',
+            'diagnostic_code' => 'POST_RESULT_PERSISTENCE_FAILED',
+            'message' => 'The QuickBooks response could not be durably recorded. Reconcile the company before any retry.',
+        ];
+    }
+
+    return [
+        'outcome' => $outcome,
+        'txn_id' => $txnId,
+        'txn_number' => $outcome === 'succeeded' ? ($result['txn_number'] ?? null) : null,
+        'diagnostic_code' => $diagnosticCode,
+        'message' => $diagnosticMessage,
+    ];
 }

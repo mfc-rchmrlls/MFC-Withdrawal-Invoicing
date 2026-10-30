@@ -18,12 +18,6 @@ $pdo = db();
 
 $no = '';
 
-/*
-|--------------------------------------------------------------------------
-| Helpers
-|--------------------------------------------------------------------------
-*/
-
 /**
  * Read a scalar POST value safely as a trimmed string.
  */
@@ -259,7 +253,6 @@ try {
 
         /*
          * Remove leading zeros before validating the integer.
-         * Examples: "005" becomes "5"; "000" is rejected.
          */
         $normalizedQty = ltrim($qty, '0');
 
@@ -341,7 +334,6 @@ try {
 
     if ($withdrawalId !== null) {
         /*
-         * Existing withdrawal:
          * identify the record by its database ID, not its posted number alone.
          */
         $find = $pdo->prepare(
@@ -421,7 +413,6 @@ try {
     } else {
         /*
          * New withdrawal:
-         * Never turn a duplicate withdrawal number into an update.
          */
         $find = $pdo->prepare(
             'SELECT id

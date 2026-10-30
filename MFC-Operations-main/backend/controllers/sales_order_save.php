@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 require_once __DIR__ . '/../config/app.php';
 require_login();
@@ -42,7 +43,7 @@ try {
 
     $rawItems = $_POST['items'] ?? null;
     if (!is_array($rawItems)) throw new RuntimeException('Sales Order lines are invalid.');
-    $products = $pdo->prepare('SELECT id,product_name,qb_code,qb_list_id,qb_description,u_m,active FROM products WHERE id=?');
+    $products = $pdo->prepare('SELECT id,product_name,qb_code,item_code,qb_list_id,qb_description,u_m,active FROM products WHERE id=?');
     $sites = $pdo->prepare('SELECT id FROM sites WHERE id=? AND active=1');
     $validItems = [];
     foreach ($rawItems as $index => $item) {
@@ -54,7 +55,7 @@ try {
         $quantityRaw = $toText($item['ordered_quantity'] ?? null);
         $rateRaw = $toText($item['rate'] ?? null);
         $empty = !$productId && $description === '' && !$siteId && $quantityRaw === '' && $rateRaw === '';
-        foreach (['lot_number','u_m','class_name','line_status','fulfilled_quantity','expiration_date','tax_code'] as $field) $empty = $empty && $toText($item[$field] ?? null) === '';
+        foreach (['lot_number', 'u_m', 'class_name', 'line_status', 'fulfilled_quantity', 'expiration_date', 'tax_code'] as $field) $empty = $empty && $toText($item[$field] ?? null) === '';
         if ($empty) continue;
         if (!$productId) throw new RuntimeException("Line {$line}: ITEM is required.");
         if ($description === '') throw new RuntimeException("Line {$line}: DESCRIPTION is required and cannot contain only spaces.");
@@ -71,8 +72,9 @@ try {
         $products->execute([$productId]);
         $product = $products->fetch();
         if (!$product || (int)$product['active'] !== 1) throw new RuntimeException("Line {$line}: ITEM must be an active product in Product Master.");
+        if (!product_codes_match($product['item_code'] ?? null, $product['qb_code'] ?? null)) throw new RuntimeException("Line {$line}: Product Master has conflicting Item Code and QB Code values. Resolve the shared code before saving this Sales Order.");
         $lot = $toText($item['lot_number'] ?? null);
-        $unit = $toText($item['u_m'] ?? null);
+        $unit = $toText($product['u_m'] ?? null);
         $class = $toText($item['class_name'] ?? null);
         $lineStatus = $toText($item['line_status'] ?? null);
         $fulfilledRaw = $toText($item['fulfilled_quantity'] ?? null);
@@ -81,40 +83,40 @@ try {
         if (mb_strlen($lot) > 100 || mb_strlen($unit) > 40 || mb_strlen($class) > 100 || mb_strlen($lineStatus) > 40) throw new RuntimeException("Line {$line}: an optional text field exceeds its allowed length.");
         if ($fulfilledRaw !== '' && !preg_match('/^\d{1,9}$/D', $fulfilledRaw)) throw new RuntimeException("Line {$line}: FULFILLED QUANTITY must be a non-negative whole quantity or blank.");
         if ($expiration !== '' && !$validDate($expiration)) throw new RuntimeException("Line {$line}: EXPIRATION DATE must be a valid date or blank.");
-        if ($tax !== '' && !in_array($tax, ['Non','Tax'], true)) throw new RuntimeException("Line {$line}: TAX must be blank, Non, or Tax.");
+        if ($tax !== '' && !in_array($tax, ['Non', 'Tax'], true)) throw new RuntimeException("Line {$line}: TAX must be blank, Non, or Tax.");
         $quantity = (int)$quantityRaw;
         $rate = (float)$rateRaw;
         $amount = round($quantity * $rate, 2, PHP_ROUND_HALF_UP);
-        $validItems[] = ['line_no'=>count($validItems)+1,'product'=>$product,'site_id'=>$siteId,'description'=>$description,'quantity'=>$quantity,'rate'=>$rate,'amount'=>$amount,'lot'=>$lot ?: null,'u_m'=>$unit ?: null,'class'=>$class ?: null,'status'=>$lineStatus ?: null,'fulfilled'=>$fulfilledRaw === '' ? null : (int)$fulfilledRaw,'expiration'=>$expiration ?: null,'tax'=>$tax ?: null];
+        $validItems[] = ['line_no' => count($validItems) + 1, 'product' => $product, 'site_id' => $siteId, 'description' => $description, 'quantity' => $quantity, 'rate' => $rate, 'amount' => $amount, 'lot' => $lot ?: null, 'u_m' => $unit ?: null, 'class' => $class ?: null, 'status' => $lineStatus ?: null, 'fulfilled' => $fulfilledRaw === '' ? null : (int)$fulfilledRaw, 'expiration' => $expiration ?: null, 'tax' => $tax ?: null];
     }
     if (!$validItems) throw new RuntimeException('Add at least one complete Sales Order line.');
 
-    $pdo->prepare('UPDATE sales_orders SET customer_id=?,qb_customer_list_id=?,so_number=?,sales_order_date=?,po_no=?,memo=?,updated_by=? WHERE id=?')->execute([$customerId,$customer['qb_list_id'],$number,$date,$po ?: null,$memo ?: null,$_SESSION['user']['id'],$orderId]);
+    $pdo->prepare('UPDATE sales_orders SET customer_id=?,qb_customer_list_id=?,so_number=?,sales_order_date=?,po_no=?,memo=?,updated_by=? WHERE id=?')->execute([$customerId, $customer['qb_list_id'], $number, $date, $po ?: null, $memo ?: null, $_SESSION['user']['id'], $orderId]);
     $pdo->prepare('DELETE FROM sales_order_items WHERE sales_order_id=?')->execute([$orderId]);
     $insert = $pdo->prepare('INSERT INTO sales_order_items(sales_order_id,line_no,product_id,item_name,item_code,qb_item_list_id,site_id,description,ordered_quantity,lot_number,u_m,rate,class_name,amount,line_status,fulfilled_quantity,expiration_date,tax_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
     foreach ($validItems as $line) {
         $product = $line['product'];
-        $insert->execute([$orderId,$line['line_no'],$product['id'],$product['product_name'],$product['qb_code'],$product['qb_list_id'],$line['site_id'],$line['description'],$line['quantity'],$line['lot'],$line['u_m'],$line['rate'],$line['class'],$line['amount'],$line['status'],$line['fulfilled'],$line['expiration'],$line['tax']]);
+        $insert->execute([$orderId, $line['line_no'], $product['id'], $product['product_name'], $product['qb_code'], $product['qb_list_id'], $line['site_id'], $line['description'], $line['quantity'], $line['lot'], $line['u_m'], $line['rate'], $line['class'], $line['amount'], $line['status'], $line['fulfilled'], $line['expiration'], $line['tax']]);
     }
-    log_activity($pdo,'SAVE_DRAFT','sales_order',$orderId,'Saved local Sales Order draft '.$number.' for withdrawal '.$withdrawalNo.' with '.count($validItems).' line(s)');
+    log_activity($pdo, 'SAVE_DRAFT', 'sales_order', $orderId, 'Saved local Sales Order draft ' . $number . ' for withdrawal ' . $withdrawalNo . ' with ' . count($validItems) . ' line(s)');
     $pdo->commit();
-    flash('success','Sales Order draft saved locally. It was not sent to QuickBooks.');
+    flash('success', 'Sales Order draft saved locally. It was not sent to QuickBooks.');
 } catch (Throwable $e) {
     if ($pdo->inTransaction()) $pdo->rollBack();
     $message = $e instanceof PDOException ? 'Unable to save this Sales Order. Check that its number is unique and the Sales Order migration has been applied.' : $e->getMessage();
     if ($orderId && is_array($_POST['items'] ?? null)) {
         $headers = [];
-        foreach (['so_number','customer_id','sales_order_date','po_no','memo'] as $field) $headers[$field] = is_scalar($_POST[$field] ?? null) ? (string)$_POST[$field] : '';
+        foreach (['so_number', 'customer_id', 'sales_order_date', 'po_no', 'memo'] as $field) $headers[$field] = is_scalar($_POST[$field] ?? null) ? (string)$_POST[$field] : '';
         $items = [];
         foreach ($_POST['items'] as $item) {
             if (!is_array($item)) continue;
             $row = [];
-            foreach (['product_id','description','site_id','ordered_quantity','lot_number','u_m','rate','class_name','line_status','fulfilled_quantity','expiration_date','tax_code'] as $field) $row[$field] = is_scalar($item[$field] ?? null) ? (string)$item[$field] : '';
+            foreach (['product_id', 'description', 'site_id', 'ordered_quantity', 'lot_number', 'u_m', 'rate', 'class_name', 'line_status', 'fulfilled_quantity', 'expiration_date', 'tax_code'] as $field) $row[$field] = is_scalar($item[$field] ?? null) ? (string)$item[$field] : '';
             $items[] = $row;
         }
-        $_SESSION['_sales_order_form'] = ['id'=>$orderId,'header'=>$headers,'items'=>$items];
+        $_SESSION['_sales_order_form'] = ['id' => $orderId, 'header' => $headers, 'items' => $items];
     }
-    flash('danger',$message);
+    flash('danger', $message);
 }
 header('Location: ' . APP_BASE_URL . '/frontend/sales_order_preparation.php?withdrawal_no=' . rawurlencode($withdrawalNo));
 exit;

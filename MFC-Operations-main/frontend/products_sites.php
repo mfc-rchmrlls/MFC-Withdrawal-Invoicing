@@ -41,18 +41,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($name === '' || mb_strlen($name) > 255 || mb_strlen($ht) > 100 || mb_strlen($qb) > 100 || mb_strlen($hd) > 255 || mb_strlen($qd) > 255 || mb_strlen($um) > 40) throw new RuntimeException('A product field is missing or too long.');
                 if ($active && (!$ht || !$qb || !$hd || !$qd)) throw new RuntimeException('Active products require both codes and descriptions.');
                 if (($price !== '' && (!is_numeric($price) || (float)$price < 0)) || ($kg !== '' && (!is_numeric($kg) || (float)$kg < 0))) throw new RuntimeException('Price and KG/Box must be non-negative numbers.');
-                foreach (['product_name' => $name, 'ht_code' => $ht, 'qb_code' => $qb] as $col => $val) {
-                    $q = $pdo->prepare("SELECT id FROM products WHERE LOWER(TRIM($col))=LOWER(TRIM(?)) AND id<>? LIMIT 1");
-                    $q->execute([$val, $id ?: 0]);
-                    if ($q->fetchColumn()) throw new RuntimeException('That product name or code is already in use.');
-                }
+                $q = $pdo->prepare(
+                    'SELECT id FROM products
+                     WHERE (LOWER(TRIM(product_name))=LOWER(TRIM(?))
+                         OR LOWER(TRIM(ht_code))=LOWER(TRIM(?))
+                         OR LOWER(TRIM(qb_code))=LOWER(TRIM(?))
+                         OR LOWER(TRIM(item_code))=LOWER(TRIM(?)))
+                       AND id<>? LIMIT 1'
+                );
+                $q->execute([$name, $ht, $qb, $qb, $id ?: 0]);
+                if ($q->fetchColumn()) throw new RuntimeException('That product name or code is already in use.');
                 if ($id) {
-                    $q = $pdo->prepare('SELECT active FROM products WHERE id=?');
+                    $q = $pdo->prepare('SELECT active,item_code,qb_code FROM products WHERE id=?');
                     $q->execute([$id]);
-                    $previous = $q->fetchColumn();
-                    if ($previous === false) throw new RuntimeException('Product not found.');
+                    $previous = $q->fetch();
+                    if (!$previous) throw new RuntimeException('Product not found.');
+                    if (!product_codes_match($previous['item_code'], $previous['qb_code'])
+                        && ($_POST['confirm_code_sync'] ?? null) !== '1') {
+                        throw new RuntimeException('This product has conflicting Item Code and QB Code values. Review both values, enter the confirmed shared code, and explicitly confirm synchronization before saving. No product data was changed.');
+                    }
+                    $activeBeforeUpdate = $previous['active'];
                     $pdo->prepare('UPDATE products SET product_name=?,ht_code=?,qb_code=?,ht_description=?,qb_description=?,item_code=?,description=?,u_m=?,default_price=?,kg_per_box=?,active=? WHERE id=?')->execute([$name, $ht ?: null, $qb ?: null, $hd ?: null, $qd ?: null, $qb ?: null, $qd ?: null, $um ?: null, $price === '' ? null : $price, $kg === '' ? null : $kg, $active, $id]);
-                    $actionLog = (int)$previous === $active ? 'UPDATE' : ($active ? 'ACTIVATE' : 'DEACTIVATE');
+                    $actionLog = (int)$activeBeforeUpdate === $active ? 'UPDATE' : ($active ? 'ACTIVATE' : 'DEACTIVATE');
                     log_activity($pdo, $actionLog, 'product', $id, 'Updated product ' . $name);
                 } else {
                     $pdo->prepare('INSERT INTO products(product_name,ht_code,qb_code,ht_description,qb_description,item_code,description,u_m,default_price,kg_per_box,active) VALUES(?,?,?,?,?,?,?,?,?,?,1)')->execute([$name, $ht, $qb, $hd, $qd, $qb, $qd, $um ?: null, $price === '' ? null : $price, $kg === '' ? null : $kg]);
@@ -101,6 +111,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 $products = $manager ? $pdo->query('SELECT p.*,(SELECT COUNT(*) FROM withdrawal_items wi WHERE wi.product_id=p.id) withdrawal_refs,(SELECT COUNT(*) FROM invoice_items ii WHERE ii.product_id=p.id) invoice_refs FROM products p ORDER BY p.product_name')->fetchAll() : get_products($pdo);
 $sites = $manager ? $pdo->query('SELECT s.*,(SELECT COUNT(*) FROM invoice_items ii WHERE ii.site_id=s.id) invoice_refs FROM sites s ORDER BY s.site_name')->fetchAll() : get_sites($pdo);
+$allProductCodeConflicts = $manager
+    ? array_filter($products, static fn($p) => !product_codes_match($p['item_code'] ?? null, $p['qb_code'] ?? null))
+    : [];
 $allProductCount = count($products);
 $allSiteCount = count($sites);
 $search = trim((string)($_GET['q'] ?? ''));
@@ -108,7 +121,7 @@ $productStatus = $manager ? (string)($_GET['status'] ?? 'all') : 'active';
 if (!in_array($productStatus, ['all', 'active', 'inactive'], true)) $productStatus = 'all';
 if ($productStatus === 'active') $products = array_values(array_filter($products, fn($p) => (int)$p['active'] === 1));
 elseif ($productStatus === 'inactive') $products = array_values(array_filter($products, fn($p) => (int)$p['active'] !== 1));
-if ($search !== '') $products = array_values(array_filter($products, fn($p) => stripos(implode(' ', [$p['product_name'], $p['ht_code'], $p['qb_code'], $p['ht_description'], $p['qb_description']]), $search) !== false));
+if ($search !== '') $products = array_values(array_filter($products, fn($p) => stripos(implode(' ', [$p['product_name'], $p['ht_code'], $p['item_code'], $p['qb_code'], $p['ht_description'], $p['qb_description']]), $search) !== false));
 $sortKey = (string)($_GET['sort'] ?? 'product_name');
 $sortKey = in_array($sortKey, ['product_name', 'ht_code', 'qb_code', 'ht_description', 'qb_description'], true) ? $sortKey : 'product_name';
 usort($products, fn($a, $b) => strcasecmp((string)($a[$sortKey] ?? ''), (string)($b[$sortKey] ?? '')));
@@ -120,10 +133,19 @@ elseif ($siteStatus === 'inactive') $sites = array_values(array_filter($sites, f
 if ($siteSearch !== '') $sites = array_values(array_filter($sites, fn($s) => stripos($s['site_name'], $siteSearch) !== false));
 $postedProduct = $err !== '' && in_array($_POST['action'] ?? '', ['save_product'], true) ? $_POST : [];
 $postedSite = $err !== '' && in_array($_POST['action'] ?? '', ['save_site'], true) ? $_POST : [];
+$postedProductCodeConflict = false;
+if ($postedProduct && filter_var($postedProduct['id'] ?? null, FILTER_VALIDATE_INT)) {
+    foreach ($products as $product) {
+        if ((int)$product['id'] === (int)$postedProduct['id']) {
+            $postedProductCodeConflict = !product_codes_match($product['item_code'] ?? null, $product['qb_code'] ?? null);
+            break;
+        }
+    }
+}
 require __DIR__ . '/includes/layout_start.php'; ?>
 <div class="page-intro catalog-intro">
     <div>
-        <h2>Products &amp; Sites</h2>
+        <!-- <h2>Products &amp; Sites</h2> -->
         <p>Manage product master data and site records.</p>
     </div>
     <?php if ($manager): ?><button class="btn btn-primary" type="button" data-bs-toggle="modal" data-bs-target="#productModal" data-product-create><i class="bi bi-plus-lg" aria-hidden="true"></i> Add Product</button><?php endif; ?>
@@ -132,6 +154,7 @@ require __DIR__ . '/includes/layout_start.php'; ?>
 <?php
 $reviewProducts = array_filter($products, static fn($p) => trim((string)($p['ht_code'] ?? '')) === '' || trim((string)($p['qb_code'] ?? '')) === '' || trim((string)($p['ht_description'] ?? '')) === '' || trim((string)($p['qb_description'] ?? '')) === '');
 if ($manager && $reviewProducts): ?><div class="alert alert-warning" role="status"><strong>Mapping review:</strong> <?= count($reviewProducts) ?> displayed product(s) need code or description mappings. Complete HT Codes from the authoritative HT list before using these products in new withdrawals.</div><?php endif; ?>
+<?php if ($manager && $allProductCodeConflicts): ?><div class="alert alert-danger" role="alert"><strong>Product code conflicts:</strong> <?= count($allProductCodeConflicts) ?> product(s) have different legacy Item Code and QB Code values. Search either code, review each product, and explicitly confirm the shared code before saving changes.</div><?php endif; ?>
 
 <section class="panel catalog-panel mb-4" aria-labelledby="productMasterTitle">
     <div class="catalog-heading">
@@ -141,19 +164,19 @@ if ($manager && $reviewProducts): ?><div class="alert alert-warning" role="statu
         </div>
     </div>
     <form method="get" class="catalog-toolbar">
-        <div class="catalog-search"><i class="bi bi-search" aria-hidden="true"></i><label class="visually-hidden" for="productSearch">Search products</label><input id="productSearch" class="form-control" name="q" value="<?= e($search) ?>" placeholder="Search product name, HT code, QB code, or description"><button class="btn btn-outline-primary" type="submit">Search</button></div>
+        <div class="catalog-search"><i class="bi bi-search" aria-hidden="true"></i><label class="visually-hidden" for="productSearch">Search products</label><input id="productSearch" class="form-control" name="q" value="<?= e($search) ?>" placeholder="Search product name, HT code, Item Code / QB Code, or description"><button class="btn btn-outline-primary" type="submit">Search</button></div>
         <?php if ($manager): ?><label class="visually-hidden" for="productStatus">Product status</label><select id="productStatus" class="form-select catalog-filter" name="status">
                 <option value="all" <?= $productStatus === 'all' ? 'selected' : '' ?>>All statuses</option>
                 <option value="active" <?= $productStatus === 'active' ? 'selected' : '' ?>>Active</option>
                 <option value="inactive" <?= $productStatus === 'inactive' ? 'selected' : '' ?>>Inactive</option>
             </select><?php endif; ?>
-        <label class="visually-hidden" for="productSort">Sort products</label><select id="productSort" class="form-select catalog-filter" name="sort"><?php foreach (['product_name' => 'Product Name', 'ht_code' => 'HT Code', 'qb_code' => 'QB Code', 'ht_description' => 'HT Description', 'qb_description' => 'QB Description'] as $key => $label): ?><option value="<?= e($key) ?>" <?= $sortKey === $key ? 'selected' : '' ?>>Sort: <?= e($label) ?></option><?php endforeach; ?></select>
+        <label class="visually-hidden" for="productSort">Sort products</label><select id="productSort" class="form-select catalog-filter" name="sort"><?php foreach (['product_name' => 'Product Name', 'ht_code' => 'HT Code', 'qb_code' => 'Item Code / QB Code', 'ht_description' => 'HT Description', 'qb_description' => 'QB Description'] as $key => $label): ?><option value="<?= e($key) ?>" <?= $sortKey === $key ? 'selected' : '' ?>>Sort: <?= e($label) ?></option><?php endforeach; ?></select>
         <a class="btn btn-light catalog-clear" href="products_sites.php" aria-label="Clear product search and filters">Clear</a>
     </form>
     <div class="table-responsive catalog-table-wrap" tabindex="0" aria-label="Product master table">
         <table class="table catalog-table">
             <thead>
-                <tr><?php foreach (['Product Name', 'HT Code', 'QB Code', 'HT Description', 'QB Description', 'U/M', 'Price (PHP)', 'KG/Box'] as $heading): ?><th scope="col"><?= e($heading) ?></th><?php endforeach; ?><?php if ($manager): ?><th scope="col">Status</th>
+                <tr><?php foreach (['Product Name', 'HT Code', 'Item Code / QB Code', 'HT Description', 'QB Description', 'U/M', 'Price (PHP)', 'KG/Box'] as $heading): ?><th scope="col"><?= e($heading) ?></th><?php endforeach; ?><?php if ($manager): ?><th scope="col">Status</th>
                         <th scope="col">Actions</th><?php endif; ?>
                 </tr>
             </thead>
@@ -176,7 +199,7 @@ if ($manager && $reviewProducts): ?><div class="alert alert-warning" role="statu
                             <td><span class="status-pill <?= $inactive ? 'status-muted' : 'status-success' ?>"><?= $inactive ? 'Inactive' : 'Active' ?></span><?php if ($missing): ?><span class="catalog-missing-note">Mapping incomplete</span><?php endif; ?></td>
                             <td>
                                 <div class="catalog-actions">
-                                    <button class="btn btn-light btn-sm" type="button" data-bs-toggle="modal" data-bs-target="#productModal" data-product-edit data-id="<?= (int)$p['id'] ?>" data-name="<?= e($p['product_name']) ?>" data-ht="<?= e($p['ht_code'] ?? '') ?>" data-qb="<?= e($p['qb_code'] ?? '') ?>" data-ht-description="<?= e($p['ht_description'] ?? '') ?>" data-qb-description="<?= e($p['qb_description'] ?? '') ?>" data-um="<?= e($p['u_m'] ?? '') ?>" data-price="<?= e($p['default_price'] ?? '') ?>" data-kg="<?= e($p['kg_per_box'] ?? '') ?>" data-active="<?= (int)$p['active'] ?>"><i class="bi bi-pencil" aria-hidden="true"></i><span>Edit</span></button>
+                                    <button class="btn btn-light btn-sm" type="button" data-bs-toggle="modal" data-bs-target="#productModal" data-product-edit data-id="<?= (int)$p['id'] ?>" data-name="<?= e($p['product_name']) ?>" data-ht="<?= e($p['ht_code'] ?? '') ?>" data-qb="<?= e($p['qb_code'] ?? '') ?>" data-item-code="<?= e($p['item_code'] ?? '') ?>" data-code-conflict="<?= product_codes_match($p['item_code'] ?? null, $p['qb_code'] ?? null) ? '0' : '1' ?>" data-ht-description="<?= e($p['ht_description'] ?? '') ?>" data-qb-description="<?= e($p['qb_description'] ?? '') ?>" data-um="<?= e($p['u_m'] ?? '') ?>" data-price="<?= e($p['default_price'] ?? '') ?>" data-kg="<?= e($p['kg_per_box'] ?? '') ?>" data-active="<?= (int)$p['active'] ?>"><i class="bi bi-pencil" aria-hidden="true"></i><span>Edit</span></button>
                                     <?php if ($deleteBlocked): ?><span class="catalog-delete-note" title="Referenced by <?= $p['withdrawal_refs'] ?> withdrawal line(s) and <?= $p['invoice_refs'] ?> invoice line(s)">In use · deactivate to retain history</span><?php else: ?><form method="post" data-confirm-submit="This permanently deletes <?= e($p['product_name']) ?>. This action cannot be undone." data-confirm-title="Delete product?" data-confirm-button="Delete product"><input type="hidden" name="_csrf" value="<?= e(csrf_token()) ?>"><input type="hidden" name="action" value="delete_product"><input type="hidden" name="id" value="<?= (int)$p['id'] ?>"><button class="btn btn-light btn-sm catalog-delete" type="submit" aria-label="Delete <?= e($p['product_name']) ?>"><i class="bi bi-trash3" aria-hidden="true"></i></button></form><?php endif; ?>
                                 </div>
                             </td><?php endif; ?>
@@ -254,11 +277,18 @@ if ($manager && $reviewProducts): ?><div class="alert alert-warning" role="statu
                                 <div class="col-md-4"><label class="form-label" for="productHt">HT Code</label><input class="form-control" id="productHt" name="ht_code" maxlength="100" data-product-required value="<?= e($postedProduct['ht_code'] ?? '') ?>">
                                     <div class="form-text">Withdrawal identifier from your HT list.</div>
                                 </div>
-                                <div class="col-md-4"><label class="form-label" for="productQb">QB Code</label><input class="form-control" id="productQb" name="qb_code" maxlength="100" value="<?= e($postedProduct['qb_code'] ?? '') ?>">
-                                    <div class="form-text">Invoice business code; separate from QuickBooks ListID.</div>
+                                <div class="col-md-4"><label class="form-label" for="productQb">Item Code / QB Code</label><input class="form-control" id="productQb" name="qb_code" maxlength="100" value="<?= e($postedProduct['qb_code'] ?? '') ?>">
+                                    <div class="form-text">One business product code used by both fields; separate from the internal QuickBooks ListID.</div>
                                 </div>
                             </div>
                         </fieldset>
+                        <div class="alert alert-warning mt-3 <?= $postedProductCodeConflict ? '' : 'd-none' ?>" id="productCodeConflictWarning" role="alert">
+                            <p id="productCodeConflictMessage" class="mb-2">The stored Item Code and QB Code differ. Enter the confirmed shared product code above and check the confirmation to update both fields.</p>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="confirmProductCodeSync" name="confirm_code_sync" value="1" <?= ($postedProduct['confirm_code_sync'] ?? '') === '1' ? 'checked' : '' ?> <?= $postedProductCodeConflict ? 'required' : '' ?>>
+                                <label class="form-check-label" for="confirmProductCodeSync">I confirmed the shared product code and authorize applying it to both fields.</label>
+                            </div>
+                        </div>
                         <fieldset class="catalog-fieldset">
                             <legend>Descriptions</legend>
                             <div class="row g-3">
@@ -323,6 +353,18 @@ if ($manager && $reviewProducts): ?><div class="alert alert-warning" role="statu
             productForm.elements.product_name.value = editing ? data.name : '';
             productForm.elements.ht_code.value = editing ? data.ht : '';
             productForm.elements.qb_code.value = editing ? data.qb : '';
+            const codeConflict = editing && data.codeConflict === '1';
+            const conflictWarning = document.getElementById('productCodeConflictWarning');
+            const conflictMessage = document.getElementById('productCodeConflictMessage');
+            const conflictConfirmation = productForm.elements.confirm_code_sync;
+            conflictWarning?.classList.toggle('d-none', !codeConflict);
+            if (conflictConfirmation) {
+                conflictConfirmation.required = codeConflict;
+                conflictConfirmation.checked = false;
+            }
+            if (codeConflict && conflictMessage) {
+                conflictMessage.textContent = `Stored Item Code "${data.itemCode}" differs from QB Code "${data.qb}". Enter the confirmed shared product code above and explicitly authorize applying it to both fields.`;
+            }
             productForm.elements.ht_description.value = editing ? data.htDescription : '';
             productForm.elements.qb_description.value = editing ? data.qbDescription : '';
             productForm.elements.u_m.value = editing ? data.um : '';
@@ -340,6 +382,8 @@ if ($manager && $reviewProducts): ?><div class="alert alert-warning" role="statu
                 name: button.dataset.name,
                 ht: button.dataset.ht,
                 qb: button.dataset.qb,
+                itemCode: button.dataset.itemCode,
+                codeConflict: button.dataset.codeConflict,
                 htDescription: button.dataset.htDescription,
                 qbDescription: button.dataset.qbDescription,
                 um: button.dataset.um,

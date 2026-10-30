@@ -25,12 +25,17 @@ function can_manage_products_sites(?PDO $pdo = null): bool
         $s = $pdo->prepare("SELECT 1 FROM employee_permissions WHERE employee_id=? AND permission_code='manage_products_sites'");
         $s->execute([(int)$_SESSION['user']['id']]);
         return (bool)$s->fetchColumn();
-    } catch (Throwable) { return false; }
+    } catch (Throwable) {
+        return false;
+    }
 }
 function require_products_sites_manager(): void
 {
     require_login();
-    if (!can_manage_products_sites()) { http_response_code(403); exit('Product and site management access is required.'); }
+    if (!can_manage_products_sites()) {
+        http_response_code(403);
+        exit('Product and site management access is required.');
+    }
 }
 function login_user(array $user): void
 {

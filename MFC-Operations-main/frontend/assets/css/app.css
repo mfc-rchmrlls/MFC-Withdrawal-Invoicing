@@ -1626,37 +1626,133 @@ textarea:focus-visible {
     table-layout: fixed;
 }
 
-#invoiceLines .invoice-col-site { width: 130px; }
-#invoiceLines .invoice-col-quantity { width: 70px; }
-#invoiceLines .invoice-col-lot { width: 76px; }
-#invoiceLines .invoice-col-item-code { width: 125px; }
-#invoiceLines .invoice-col-description { width: auto; }
-#invoiceLines .invoice-col-unit { width: 70px; }
-#invoiceLines .invoice-col-price { width: 130px; }
-#invoiceLines .invoice-col-amount { width: 130px; }
-#invoiceLines .invoice-col-expiration { width: 115px; }
-#invoiceLines .invoice-col-tax { width: 68px; }
+#invoiceLines .invoice-col-site {
+    width: 130px;
+}
 
-.sales-order-table-wrap { max-width: 100%; }
-.sales-order-lines-table { min-width: 1850px; table-layout: fixed; }
-.sales-order-lines-table th, .sales-order-lines-table td { vertical-align: middle; }
-.sales-order-lines-table .form-control, .sales-order-lines-table .form-select { min-width: 0; padding-left: .4rem; padding-right: .4rem; }
-.sales-order-lines-table .so-col-item { width: 190px; }
-.sales-order-lines-table .so-col-description { width: 300px; }
-.sales-order-lines-table .so-col-site { width: 150px; }
-.sales-order-lines-table .so-col-ordered { width: 105px; }
-.sales-order-lines-table .so-col-lot { width: 125px; }
-.sales-order-lines-table .so-col-um { width: 75px; }
-.sales-order-lines-table .so-col-rate { width: 130px; }
-.sales-order-lines-table .so-col-class { width: 125px; }
-.sales-order-lines-table .so-col-amount { width: 140px; }
-.sales-order-lines-table .so-col-status { width: 120px; }
-.sales-order-lines-table .so-col-fulfilled { width: 145px; }
-.sales-order-lines-table .so-col-expiration { width: 145px; }
-.sales-order-lines-table .so-col-tax { width: 85px; }
-.sales-order-item-cell { display: flex; align-items: center; gap: .25rem; }
-.sales-order-item-cell .form-select { flex: 1 1 auto; }
-.sales-order-item-cell .btn { flex: 0 0 auto; padding: .2rem .4rem; }
+#invoiceLines .invoice-col-quantity {
+    width: 70px;
+}
+
+#invoiceLines .invoice-col-lot {
+    width: 76px;
+}
+
+#invoiceLines .invoice-col-item-code {
+    width: 125px;
+}
+
+#invoiceLines .invoice-col-description {
+    width: auto;
+}
+
+#invoiceLines .invoice-col-unit {
+    width: 70px;
+}
+
+#invoiceLines .invoice-col-price {
+    width: 130px;
+}
+
+#invoiceLines .invoice-col-amount {
+    width: 130px;
+}
+
+#invoiceLines .invoice-col-expiration {
+    width: 115px;
+}
+
+#invoiceLines .invoice-col-tax {
+    width: 68px;
+}
+
+.sales-order-table-wrap {
+    max-width: 100%;
+}
+
+.sales-order-lines-table {
+    min-width: 1850px;
+    table-layout: fixed;
+}
+
+.sales-order-lines-table th,
+.sales-order-lines-table td {
+    vertical-align: middle;
+}
+
+.sales-order-lines-table .form-control,
+.sales-order-lines-table .form-select {
+    min-width: 0;
+    padding-left: .4rem;
+    padding-right: .4rem;
+}
+
+.sales-order-lines-table .so-col-item {
+    width: 190px;
+}
+
+.sales-order-lines-table .so-col-description {
+    width: 300px;
+}
+
+.sales-order-lines-table .so-col-site {
+    width: 150px;
+}
+
+.sales-order-lines-table .so-col-ordered {
+    width: 105px;
+}
+
+.sales-order-lines-table .so-col-lot {
+    width: 125px;
+}
+
+.sales-order-lines-table .so-col-um {
+    width: 75px;
+}
+
+.sales-order-lines-table .so-col-rate {
+    width: 130px;
+}
+
+.sales-order-lines-table .so-col-class {
+    width: 125px;
+}
+
+.sales-order-lines-table .so-col-amount {
+    width: 140px;
+}
+
+.sales-order-lines-table .so-col-status {
+    width: 120px;
+}
+
+.sales-order-lines-table .so-col-fulfilled {
+    width: 145px;
+}
+
+.sales-order-lines-table .so-col-expiration {
+    width: 145px;
+}
+
+.sales-order-lines-table .so-col-tax {
+    width: 85px;
+}
+
+.sales-order-item-cell {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+}
+
+.sales-order-item-cell .form-select {
+    flex: 1 1 auto;
+}
+
+.sales-order-item-cell .btn {
+    flex: 0 0 auto;
+    padding: .2rem .4rem;
+}
 
 #invoiceLines thead th {
     padding: 8px 5px;
@@ -2084,19 +2180,19 @@ textarea:focus-visible {
 }
 
 /* Keep client rows compact while leaving enough room for clear labels. */
-#clientsAccordion .client-accordion-item > .accordion-header .accordion-button {
+#clientsAccordion .client-accordion-item>.accordion-header .accordion-button {
     min-height: 50px;
     padding: 8px 16px;
 }
 
-#clientsAccordion .history-content .table-sm > :not(caption) > * > * {
+#clientsAccordion .history-content .table-sm> :not(caption)>*>* {
     padding: 7px 10px;
     line-height: 1.35;
     vertical-align: middle;
 }
 
 @media (max-width: 575.98px) {
-    #clientsAccordion .client-accordion-item > .accordion-header .accordion-button {
+    #clientsAccordion .client-accordion-item>.accordion-header .accordion-button {
         min-height: 48px;
         padding: 7px 12px;
     }

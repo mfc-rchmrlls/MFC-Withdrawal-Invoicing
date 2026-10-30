@@ -52,9 +52,9 @@ $clients = $clientQuery->fetchAll();
 $summary = $pdo->query('SELECT COUNT(*) total, COALESCE(SUM(active=1),0) active FROM clients')->fetch();
 require __DIR__ . '/includes/layout_start.php';
 ?>
+
 <div class="page-intro">
     <div>
-        <h2>Clients</h2>
         <p>Manage clients and review their invoice history.</p>
     </div><?php if ($isAdmin): ?><button class="btn btn-primary" type="button" data-bs-toggle="modal" data-bs-target="#clientModal"><i class="bi bi-plus-lg" aria-hidden="true"></i> Add Client</button><?php endif; ?>
 </div>
@@ -138,7 +138,10 @@ require __DIR__ . '/includes/layout_start.php';
                 let detailRequest = 0;
                 let lastDetailRequest = null;
 
-                const formatPeso = value => '₱' + Number(value).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                const formatPeso = value => '₱' + Number(value).toLocaleString('en-PH', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2
+                });
                 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({
                     '&': '&amp;',
                     '<': '&lt;',
@@ -148,57 +151,64 @@ require __DIR__ . '/includes/layout_start.php';
                 })[char]);
 
                 document.querySelectorAll('.accordion-collapse[data-client-id]').forEach(panel => {
-                    let historyLoaded = false;
                     panel.addEventListener('show.bs.collapse', async () => {
-                        if (historyLoaded) return;
-                        try {
-                            await loadHistory(panel, 1);
-                            historyLoaded = true;
-                        } catch (error) {
-                            const box = panel.querySelector('.history-content');
-                            box.innerHTML = '<div class="alert alert-danger mb-0">Unable to load invoice history. <button type="button" class="btn btn-sm btn-outline-danger ms-2" data-history-retry>Retry</button></div>';
-                            box.querySelector('[data-history-retry]').addEventListener('click', () => {
-                                historyLoaded = false;
-                                panel.querySelector('.accordion-button').click();
-                            });
-                        }
+                        if (panel.dataset.historyLoaded === 'true') return;
+                        await loadHistory(panel, 1);
                     });
                 });
 
                 async function loadHistory(panel, page) {
                     const box = panel.querySelector('.history-content');
-                    box.innerHTML = '<div class="text-secondary">Loading invoice history…</div>';
+                    const hadHistory = panel.dataset.historyLoaded === 'true';
+                    if (!hadHistory) {
+                        box.innerHTML = '<div class="text-secondary">Loading invoice history…</div>';
+                    }
                     const clientId = Number(panel.dataset.clientId);
                     const url = '../backend/api/client_invoice_history.php?client_id=' + encodeURIComponent(clientId) + '&page=' + encodeURIComponent(page);
-                    const response = await fetch(url, {
-                        headers: {
-                            Accept: 'application/json'
-                        },
-                        credentials: 'same-origin'
-                    });
-                    const data = await response.json();
-                    if (!response.ok) throw new Error(data.error || 'Request failed');
-                    if (!data.total) {
-                        box.innerHTML = '<p class="mb-0 text-secondary">No invoice history found for this client.</p>';
-                        return;
-                    }
-                    const historyRows = data.items.map(invoice => `<tr>
+                    try {
+                        const response = await fetch(url, {
+                            headers: {
+                                Accept: 'application/json'
+                            },
+                            credentials: 'same-origin'
+                        });
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error || 'Request failed');
+                        if (!data.total) {
+                            box.innerHTML = '<p class="mb-0 text-secondary">No invoice history found for this client.</p>';
+                            panel.dataset.historyLoaded = 'true';
+                            return true;
+                        }
+                        const historyRows = data.items.map(invoice => `<tr>
             <td><button type="button" class="btn btn-link p-0 text-start" data-bs-toggle="modal" data-bs-target="#invoiceDetailModal" data-invoice-id="${Number(invoice.id)}" data-client-id="${clientId}">${escapeHtml(invoice.invoice_number || '—')}</button></td>
             <td>${escapeHtml(invoice.invoice_date)}</td><td>${escapeHtml(invoice.withdrawal_no)}</td>
             <td>${escapeHtml(invoice.item_count)}</td><td>${escapeHtml(Number(invoice.total_quantity || 0).toLocaleString('en-PH', { maximumFractionDigits: 0 }))}</td>
             <td>${invoice.invoice_amount === null ? '—' : escapeHtml(formatPeso(invoice.invoice_amount))}</td>
             <td><span class="badge ${invoice.status === 'Invoiced' ? 'text-bg-success' : 'text-bg-secondary'}">${escapeHtml(invoice.status)}</span></td>
         </tr>`).join('');
-                    const first = (data.page - 1) * 10 + 1;
-                    const last = Math.min(data.page * 10, data.total);
-                    let pageButtons = '';
-                    for (let p = Math.max(1, data.page - 2); p <= Math.min(data.pages, data.page + 2); p++) {
-                        pageButtons += `<button type="button" class="btn btn-sm ${p === data.page ? 'btn-primary' : 'btn-outline-secondary'}" data-page="${p}" ${p === data.page ? 'aria-current="page"' : ''}>${p}</button>`;
-                    }
-                    box.innerHTML = `<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Invoice No.</th><th>Invoice Date</th><th>Withdrawal No.</th><th>Items</th><th>Total Quantity</th><th>Invoice Amount (PHP)</th><th>Status</th></tr></thead><tbody>${historyRows}</tbody></table></div>
+                        const first = (data.page - 1) * 10 + 1;
+                        const last = Math.min(data.page * 10, data.total);
+                        let pageButtons = '';
+                        for (let p = Math.max(1, data.page - 2); p <= Math.min(data.pages, data.page + 2); p++) {
+                            pageButtons += `<button type="button" class="btn btn-sm ${p === data.page ? 'btn-primary' : 'btn-outline-secondary'}" data-page="${p}" ${p === data.page ? 'aria-current="page"' : ''}>${p}</button>`;
+                        }
+                        box.innerHTML = `<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Invoice No.</th><th>Invoice Date</th><th>Withdrawal No.</th><th>Items</th><th>Total Quantity</th><th>Invoice Amount (PHP)</th><th>Status</th></tr></thead><tbody>${historyRows}</tbody></table></div>
             <div class="d-flex flex-wrap align-items-center justify-content-between gap-2"><span class="small text-secondary">Showing ${first}–${last} of ${data.total} invoices</span>
             <div class="d-flex gap-1"><button type="button" class="btn btn-sm btn-outline-secondary" data-page="${data.page - 1}" ${data.page <= 1 ? 'disabled' : ''}>Previous</button>${pageButtons}<button type="button" class="btn btn-sm btn-outline-secondary" data-page="${data.page + 1}" ${data.page >= data.pages ? 'disabled' : ''}>Next</button></div></div>`;
-                    box.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => loadHistory(panel, Number(button.dataset.page))));
+                        panel.dataset.historyLoaded = 'true';
+                        box.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => loadHistory(panel, Number(button.dataset.page))));
+                        return true;
+                    } catch (error) {
+                        let errorBox = box.querySelector('[data-history-load-error]');
+                        if (!errorBox) {
+                            errorBox = document.createElement('div');
+                            errorBox.dataset.historyLoadError = '';
+                            box.prepend(errorBox);
+                        }
+                        errorBox.innerHTML = '<div class="alert alert-danger mb-3">Unable to load invoice history. <button type="button" class="btn btn-sm btn-outline-danger ms-2" data-history-retry>Retry</button></div>';
+                        errorBox.querySelector('[data-history-retry]').addEventListener('click', () => loadHistory(panel, page));
+                        return false;
+                    }
                 }
 
                 detailModal.addEventListener('show.bs.modal', event => {
@@ -231,7 +241,7 @@ require __DIR__ . '/includes/layout_start.php';
                         detailTitle.textContent = 'Invoice ' + (invoice.invoice_number || 'Details');
                         const lines = invoice.lines.map((line, index) => `<tr><td>${index + 1}</td><td>${escapeHtml(line.item_code || '—')}</td><td>${escapeHtml(line.product_name)}</td><td>${escapeHtml(line.description || '—')}</td><td>${escapeHtml(line.site_name || '—')}</td><td class="text-end">${escapeHtml(Number(line.quantity).toLocaleString('en-PH', { maximumFractionDigits: 0 }))}</td><td>${escapeHtml(line.u_m || '—')}</td><td class="text-end">${escapeHtml(formatPeso(line.price_each))}</td><td>${escapeHtml(line.tax_code || '—')}</td><td class="text-end">${escapeHtml(formatPeso(line.amount))}</td></tr>`).join('');
                         const lineTable = lines ? `<div class="table-responsive"><table class="table table-sm align-middle"><thead><tr><th>Line</th><th>Product Code</th><th>Product</th><th>Description</th><th>Site</th><th class="text-end">Qty</th><th>Unit</th><th class="text-end">Unit Price (PHP)</th><th>Tax Code</th><th class="text-end">Line Total (PHP)</th></tr></thead><tbody>${lines}</tbody></table></div>` : '<p class="text-secondary mb-0">No invoice product rows were saved for this invoice.</p>';
-                        detailBody.innerHTML = `<dl class="row mb-4"><dt class="col-sm-3">Invoice Number</dt><dd class="col-sm-9">${escapeHtml(invoice.invoice_number || '—')}</dd><dt class="col-sm-3">Invoice Date</dt><dd class="col-sm-9">${escapeHtml(invoice.invoice_date)}</dd><dt class="col-sm-3">Client</dt><dd class="col-sm-9">${escapeHtml(invoice.client_name)}</dd><dt class="col-sm-3">Withdrawal</dt><dd class="col-sm-9">${escapeHtml(invoice.withdrawal_no)}</dd><dt class="col-sm-3">Status</dt><dd class="col-sm-9">${escapeHtml(invoice.status)}</dd>${invoice.po_no ? `<dt class="col-sm-3">PO No.</dt><dd class="col-sm-9">${escapeHtml(invoice.po_no)}</dd>` : ''}</dl>${lineTable}<div class="d-flex justify-content-end border-top pt-3 mt-3"><strong>Invoice Total: ${escapeHtml(formatPeso(invoice.subtotal))}</strong></div>`;
+                        detailBody.innerHTML = `<dl class="row mb-4"><dt class="col-sm-3">Invoice Number</dt><dd class="col-sm-9">${escapeHtml(invoice.invoice_number || '—')}</dd><dt class="col-sm-3">Invoice Date</dt><dd class="col-sm-9">${escapeHtml(invoice.invoice_date)}</dd><dt class="col-sm-3">Client</dt><dd class="col-sm-9">${escapeHtml(invoice.client_name)}</dd><dt class="col-sm-3">Withdrawal</dt><dd class="col-sm-9">${escapeHtml(invoice.withdrawal_no)}</dd><dt class="col-sm-3">Status</dt><dd class="col-sm-9">${escapeHtml(invoice.status)}</dd>${invoice.po_no ? `<dt class="col-sm-3">PO No.</dt><dd class="col-sm-9">${escapeHtml(invoice.po_no)}</dd>` : ''}</dl>${lineTable}<div class="d-flex justify-content-end border-top pt-3 mt-3"><strong>Line Amount Subtotal: ${escapeHtml(formatPeso(invoice.subtotal))}</strong></div>`;
                     } catch (error) {
                         if (requestId !== detailRequest) return;
                         detailBody.innerHTML = '<div class="alert alert-danger mb-0">Unable to load invoice details. <button type="button" class="btn btn-sm btn-outline-danger ms-2" data-detail-retry>Retry</button></div>';

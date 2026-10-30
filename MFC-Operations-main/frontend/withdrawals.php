@@ -11,8 +11,8 @@ $records = $s->fetchAll();
 ?>
 <div class="page-intro">
     <div>
-        <h2>Withdrawal Register</h2>
-        <p>Live records stored in MySQL.</p>
+        <h2>Withdrawal History</h2>
+        <p>Existing withdrawal records.</p>
     </div>
 
     <div class="toolbar">
