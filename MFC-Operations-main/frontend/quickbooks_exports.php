@@ -20,10 +20,14 @@ $bridgeSecret = getenv('WQ_QB_BRIDGE_SECRET');
 $expectedFingerprint = strtolower((string)(getenv('WQ_QB_COMPANY_FINGERPRINT') ?: ''));
 $verificationSecret = getenv('WQ_QB_VERIFICATION_SECRET');
 $bridgeUrl = getenv('WQ_QB_BRIDGE_URL');
+$effectiveBridgeUrl = $bridgeUrl === false || $bridgeUrl === ''
+    ? 'http://127.0.0.1:8765'
+    : $bridgeUrl;
 $quickBooksConfiguration = [
-    'bridge_url' => $bridgeUrl === false || $bridgeUrl === ''
-        ? 'Using the default IPv4 loopback endpoint'
-        : 'Explicitly configured; value withheld',
+    'bridge_url' => $effectiveBridgeUrl === 'http://127.0.0.1:8765'
+        ? ($bridgeUrl === false || $bridgeUrl === '' ? 'Default loopback URL' : 'Configured loopback URL')
+        : 'Unexpected URL; loopback required',
+    'bridge_url_valid' => $effectiveBridgeUrl === 'http://127.0.0.1:8765',
     'bridge_secret' => is_string($bridgeSecret) && strlen($bridgeSecret) >= 32,
     'company_fingerprint' => preg_match('/^[a-f0-9]{64}$/D', $expectedFingerprint) === 1,
     'verification_secret' => is_string($verificationSecret) && strlen($verificationSecret) >= 32,
@@ -429,29 +433,50 @@ require __DIR__ . '/includes/layout_start.php';
                 <thead><tr><th scope="col">Requirement</th><th scope="col">PHP runtime status</th><th scope="col">Next step</th></tr></thead>
                 <tbody>
                     <tr>
-                        <th scope="row">Bridge endpoint</th>
+                        <th scope="row">PHP bridge URL</th>
                         <td><?= e($quickBooksConfiguration['bridge_url']) ?></td>
-                        <td>Bridge must listen on IPv4 loopback port 8765; startup alone does not establish company access.</td>
+                        <td><?= $quickBooksConfiguration['bridge_url_valid'] ? 'The PHP runtime targets the required IPv4 loopback endpoint.' : 'Correct the protected local configuration and restart Apache through start-apache-with-qb-config.ps1.' ?></td>
                     </tr>
                     <tr>
-                        <th scope="row">Bridge authentication</th>
+                        <th scope="row">Shared bridge authentication</th>
                         <td><?= $quickBooksConfiguration['bridge_secret'] ? 'Configured (minimum length met)' : 'Missing or too short' ?></td>
-                        <td>Use the same protected secret in the PHP and interactive bridge process environments. Secret values are never displayed here.</td>
+                        <td><?= !empty($bridge['available']) ? 'Signed bridge health succeeded from this PHP runtime; secret values are never displayed.' : 'The PHP and bridge processes must load the same protected secret. Secret values are never displayed here.' ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">PHP verification secret</th>
+                        <td><?= $quickBooksConfiguration['verification_secret'] ? 'Configured (minimum length met)' : 'Missing or too short' ?></td>
+                        <td>Used by PHP to sign human-approved mapping evidence; it is separate from the bridge authentication secret.</td>
                     </tr>
                     <tr>
                         <th scope="row">Expected company fingerprint</th>
                         <td><?= $quickBooksConfiguration['company_fingerprint'] ? 'Configured (format valid)' : 'Missing or invalid' ?></td>
-                        <td>Set only after visually confirming the intended company and obtaining its fingerprint from the read-only identity command.</td>
+                        <td>Set only after visually confirming Testing QB.qbw and reviewing the read-only SDK identity. PHP and bridge independently enforce it.</td>
                     </tr>
                     <tr>
-                        <th scope="row">Reference-evidence signing key</th>
-                        <td><?= $quickBooksConfiguration['verification_secret'] ? 'Configured (minimum length met)' : 'Missing or too short' ?></td>
-                        <td>Configure a protected PHP-side key; do not place secrets in source, web output, or chat.</td>
+                        <th scope="row">QuickBooks Desktop process</th>
+                        <td>
+                            <?php if (array_key_exists('quickBooksProcessRunning', $bridgeHealth)): ?>
+                                <?= $bridgeHealth['quickBooksProcessRunning'] ? 'Running' : 'Not running' ?>
+                            <?php else: ?>
+                                Unknown until authenticated bridge health succeeds
+                            <?php endif; ?>
+                        </td>
+                        <td>A running process does not confirm the open company or SDK authorization.</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">SDK authorization / company identity</th>
+                        <td><?= !empty($companyDiagnostic['company_identity_verified']) ? 'Read-only SDK identity query succeeded' : 'Not verified; run the explicit company check' ?></td>
+                        <td><?php if (!empty($companyDiagnostic['diagnostic_code'])): ?>Last check: <code><?= e((string)$companyDiagnostic['diagnostic_code']) ?></code>.<?php endif; ?> If the SDK reports <code>SDK_COM_80040418</code>, the built-in QuickBooks Admin must authorize first-time access in QuickBooks; do not bypass it.</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Company fingerprint match</th>
+                        <td><?= !empty($companyDiagnostic['company_identity_verified']) ? 'Matched for the explicit signed diagnostic' : 'Not verified in this request' ?></td>
+                        <td>A successful signed identity diagnostic is checked against the PHP-configured expected fingerprint. Re-run it for the currently open company.</td>
                     </tr>
                     <tr>
                         <th scope="row">Invoice writes in PHP</th>
                         <td><?= $quickBooksConfiguration['php_write_enabled'] ? 'Enabled by configuration' : 'Disabled' ?></td>
-                        <td>Keep disabled until accounting sign-off. No live posting is authorized by this diagnostic workflow.</td>
+                        <td>Must remain disabled during setup. This status is independent of bridge write configuration.</td>
                     </tr>
                     <tr>
                         <th scope="row">Authenticated bridge health</th>
@@ -472,9 +497,9 @@ require __DIR__ . '/includes/layout_start.php';
                         </td>
                     </tr>
                     <tr>
-                        <th scope="row">Company identity</th>
-                        <td><?= !empty($companyDiagnostic['company_identity_verified']) ? 'Verified for the explicit diagnostic shown below' : 'Not verified in this request' ?></td>
-                        <td>Run “Check active QuickBooks company and session” only after the intended company file is open and confirmed.</td>
+                        <th scope="row">Invoice posting readiness</th>
+                        <td><?= !$quickBooksConfiguration['php_write_enabled'] && ($bridgeHealth['invoiceWriteEnabled'] ?? false) !== true ? 'Not enabled (safe setup state)' : 'Not ready; review all company and invoice gates' ?></td>
+                        <td>A ready bridge/configuration alone is not invoice readiness. Keep writes disabled until company identity, authorization, mappings, accounting preflight, and explicit invoice approval are complete.</td>
                     </tr>
                 </tbody>
             </table>
