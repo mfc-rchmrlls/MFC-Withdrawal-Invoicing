@@ -72,6 +72,38 @@ try {
     $first->exec("INSERT INTO employees(id,role,active) VALUES (1,'Admin',1)");
     $first->exec("INSERT INTO qb_jobs(invoice_id,marker) VALUES (9,'legacy-history')");
 
+    $first->exec(
+        'CREATE TABLE invoice_items (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            price_each DECIMAL(12,2) NOT NULL DEFAULT 0,
+            amount DECIMAL(14,2) NOT NULL DEFAULT 0
+        ) ENGINE=InnoDB'
+    );
+    $first->exec("INSERT INTO invoice_items(id,price_each,amount) VALUES (1,0.00,0.00),(2,12.50,25.00)");
+    $priceMigrationPath = __DIR__ . '/../backend/database/migrations/20261103_invoice_price_provenance.sql';
+    $priceMigration = file_get_contents($priceMigrationPath);
+    if (!is_string($priceMigration)) {
+        throw new RuntimeException('Could not read the invoice price provenance migration.');
+    }
+    $priceMigration = preg_replace('/^\s*--.*$/m', '', $priceMigration);
+    foreach (preg_split('/;\s*/', $priceMigration, -1, PREG_SPLIT_NO_EMPTY) as $statement) {
+        $first->exec(trim($statement));
+    }
+    $historicalPrices = $first->query('SELECT id,price_each,amount,price_source FROM invoice_items ORDER BY id')->fetchAll();
+    maria_assert(
+        count($historicalPrices) === 2
+            && (float)$historicalPrices[0]['price_each'] === 0.0
+            && (float)$historicalPrices[1]['price_each'] === 12.5
+            && $historicalPrices[0]['price_source'] === 'unresolved'
+            && $historicalPrices[1]['price_source'] === 'unresolved',
+        'price provenance migration preserves historical values and classifies their origin as unresolved'
+    );
+    $first->exec("INSERT INTO invoice_items(price_each,amount,price_source) VALUES (NULL,NULL,'quickbooks_pending')");
+    maria_assert(
+        $first->query('SELECT price_each IS NULL AND amount IS NULL AND price_source=\'quickbooks_pending\' FROM invoice_items WHERE id=3')->fetchColumn() == 1,
+        'invoice schema accepts a blank price without converting it to zero'
+    );
+
     foreach (['20261023_typed_qb_exports.sql'] as $migrationName) {
         $migrationPath = __DIR__ . '/../backend/database/migrations/' . $migrationName;
         $migration = file_get_contents($migrationPath);

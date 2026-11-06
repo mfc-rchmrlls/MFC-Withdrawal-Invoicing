@@ -85,6 +85,47 @@ final class QuickBooksBridgeClient
         ], 15);
     }
 
+    public function scanReferences(array $siteNames, array $itemListIds, array $taxCodeListIds): array
+    {
+        foreach ([
+            'site names' => [$siteNames, 255, false],
+            'item ListIDs' => [$itemListIds, 100, true],
+            'tax-code ListIDs' => [$taxCodeListIds, 100, true],
+        ] as $label => [$values, $maximumLength, $listIds]) {
+            if (count($values) > 20) {
+                throw new InvalidArgumentException('The reference scan contains too many ' . $label . '.');
+            }
+            $seen = [];
+            foreach ($values as $value) {
+                if (
+                    !is_string($value)
+                    || $value === ''
+                    || $value !== trim($value)
+                    || mb_strlen($value) > $maximumLength
+                    || preg_match('/[\x00-\x1F\x7F]/', $value)
+                    || ($listIds && !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $value))
+                ) {
+                    throw new InvalidArgumentException('The reference scan contains an invalid ' . $label . ' value.');
+                }
+                if (in_array($value, $seen, true)) {
+                    throw new InvalidArgumentException('The reference scan contains duplicate ' . $label . '.');
+                }
+                $seen[] = $value;
+            }
+        }
+        $configuration = $this->companyFingerprintConfigurationFailure();
+        if ($configuration !== null) {
+            return $configuration;
+        }
+        return $this->request('diagnose', [
+            'operation' => 'diagnose',
+            'entity' => 'reference_scan',
+            'siteNames' => array_values($siteNames),
+            'itemListIds' => array_values($itemListIds),
+            'taxCodeListIds' => array_values($taxCodeListIds),
+        ], 35);
+    }
+
     public function lookupInventorySiteFullName(string $fullName): array
     {
         if (
@@ -339,14 +380,17 @@ final class QuickBooksBridgeClient
             'requestId',
             'operation',
             'transactionType',
+            'preparationMode',
             'idempotencyKey',
             'source',
             'transaction',
         ];
+        $preparationMode = $request['preparationMode'] ?? null;
         if (
             array_diff(array_keys($request), $allowedKeys)
-            || array_diff(['protocolVersion', 'requestId', 'operation', 'transactionType', 'idempotencyKey', 'source', 'transaction'], array_keys($request))
+            || array_diff(['protocolVersion', 'requestId', 'operation', 'transactionType', 'preparationMode', 'idempotencyKey', 'source', 'transaction'], array_keys($request))
             || ($request['protocolVersion'] ?? null) !== '1'
+            || !in_array($preparationMode, ['quickbooks_managed_defaults', 'legacy_mapped'], true)
             || !is_string($request['requestId'] ?? null)
             || !preg_match('/^[a-f0-9-]{36}$/iD', $request['requestId'])
             || !is_string($request['idempotencyKey'] ?? null)
@@ -399,21 +443,23 @@ final class QuickBooksBridgeClient
         }
         if (
             !is_array($transaction['customer'] ?? null)
-            || array_diff(array_keys($transaction['customer']), ['listId'])
-            || !is_string($transaction['customer']['listId'] ?? null)
-            || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $transaction['customer']['listId'])
+            || !$this->isValidInvoiceReference($transaction['customer'], 'customer')
         ) {
             throw new InvalidArgumentException('The invoice write customer reference is invalid.');
         }
         foreach ($transaction['lines'] as $line) {
+            $requiredLineKeys = ['item', 'description', 'quantity', 'rate', 'expectedAmount', 'site'];
+            $requiredLineKeys[] = 'pricingSource';
+            if ($preparationMode === 'legacy_mapped') {
+                $requiredLineKeys[] = 'salesTaxCode';
+            }
             if (
                 !is_array($line)
-                || array_diff(array_keys($line), ['item', 'description', 'quantity', 'rate', 'expectedAmount', 'salesTaxCode', 'site', 'lotNumber', 'expirationDate', 'unitOfMeasure'])
-                || array_diff(['item', 'description', 'quantity', 'rate', 'expectedAmount', 'salesTaxCode', 'site'], array_keys($line))
+                || array_diff(array_keys($line), ['item', 'description', 'quantity', 'rate', 'expectedAmount', 'pricingSource', 'salesTaxCode', 'site', 'lotNumber', 'expirationDate', 'unitOfMeasure'])
+                || array_diff($requiredLineKeys, array_keys($line))
+                || !in_array(($line['pricingSource'] ?? null), ['mfc_entered', 'explicit_zero'], true)
                 || !is_array($line['item'] ?? null)
-                || array_diff(array_keys($line['item']), ['listId'])
-                || !is_string($line['item']['listId'] ?? null)
-                || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $line['item']['listId'])
+                || !$this->isValidInvoiceReference($line['item'], 'item')
                 || !is_string($line['description'] ?? null)
                 || mb_strlen($line['description']) > 4095
                 || !is_string($line['quantity'] ?? null)
@@ -422,10 +468,12 @@ final class QuickBooksBridgeClient
                 || qb_export_money_cents($line['rate']) === null
                 || !is_string($line['expectedAmount'] ?? null)
                 || qb_export_money_cents($line['expectedAmount']) === null
-                || !is_array($line['salesTaxCode'] ?? null)
-                || array_diff(array_keys($line['salesTaxCode']), ['listId'])
-                || !is_string($line['salesTaxCode']['listId'] ?? null)
-                || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $line['salesTaxCode']['listId'])
+                || ($preparationMode === 'legacy_mapped'
+                    && (!is_array($line['salesTaxCode'] ?? null)
+                        || array_diff(array_keys($line['salesTaxCode']), ['listId'])
+                        || !is_string($line['salesTaxCode']['listId'] ?? null)
+                        || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $line['salesTaxCode']['listId'])))
+                || ($preparationMode === 'quickbooks_managed_defaults' && array_key_exists('salesTaxCode', $line))
                 || !is_string($line['site'] ?? null)
                 || trim($line['site']) === ''
                 || $line['site'] !== trim($line['site'])
@@ -440,7 +488,12 @@ final class QuickBooksBridgeClient
             $quantity = (int)$line['quantity'];
             $rateCents = qb_export_money_cents($line['rate']);
             $amountCents = qb_export_money_cents($line['expectedAmount']);
-            if ($rateCents === null || $amountCents === null || $quantity * $rateCents !== $amountCents) {
+            if (
+                $rateCents === null
+                || $amountCents === null
+                || (($line['pricingSource'] ?? null) === 'explicit_zero' && $rateCents !== 0)
+                || $quantity * $rateCents !== $amountCents
+            ) {
                 throw new InvalidArgumentException('The invoice write line amount does not reconcile to quantity and rate.');
             }
         }
@@ -488,14 +541,17 @@ final class QuickBooksBridgeClient
         );
     }
 
-    public function preflightInvoice(array $transaction): array
+    public function preflightInvoice(array $transaction, string $preparationMode = 'legacy_mapped'): array
     {
         $errors = [];
-        $customer = $transaction['customer']['listId'] ?? null;
+        if (!in_array($preparationMode, ['quickbooks_managed_defaults', 'legacy_mapped'], true)) {
+            return ['ready' => false, 'errors' => [['code' => 'INVALID_PREPARATION_MODE', 'message' => 'The invoice preparation mode is unsupported.']]];
+        }
+        $customerReference = $transaction['customer'] ?? null;
         $lines = $transaction['lines'] ?? null;
         if (
-            !is_string($customer)
-            || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $customer)
+            !is_array($customerReference)
+            || !$this->isValidInvoiceReference($customerReference, 'customer')
             || !is_array($lines)
             || count($lines) < 1
             || count($lines) > 500
@@ -505,28 +561,94 @@ final class QuickBooksBridgeClient
 
         $preferencesResult = $this->diagnoseCompanyConfiguration('company_preferences');
         $preferences = $preferencesResult['response']['records'][0] ?? null;
-        if (
-            !($preferencesResult['available'] ?? false)
-            || !is_array($preferences)
-            || ($preferences['customerTaxCodeEnabled'] ?? false) !== true
-            || ($preferences['multiLocationAvailable'] ?? false) !== true
-            || ($preferences['multiLocationEnabled'] ?? false) !== true
-        ) {
-            $errors[] = ['code' => 'COMPANY_INVOICE_SETTINGS_UNVERIFIED', 'message' => 'QuickBooks customer tax-code and inventory-site settings could not be verified as enabled.'];
+        $preferencesAvailable = ($preferencesResult['available'] ?? false) === true && is_array($preferences);
+        if (!$preferencesAvailable) {
+            $errors[] = [
+                'code' => 'COMPANY_PREFERENCES_QUERY_FAILED',
+                'message' => 'QuickBooks company preferences could not be read; company-level invoice settings remain unverified.',
+                'diagnostic_code' => $preferencesResult['diagnostic_code'] ?? null,
+                'failure_stage' => $preferencesResult['failure_stage'] ?? null,
+                'sdk_error_code' => $preferencesResult['sdk_error_code'] ?? null,
+                'request_id' => $preferencesResult['request_id'] ?? null,
+                'shared_failure' => true,
+            ];
+        } else {
+            $multiLocationAvailable = $preferences['multiLocationAvailable'] ?? null;
+            $multiLocationEnabled = $preferences['multiLocationEnabled'] ?? null;
+            if ($multiLocationAvailable === false || $multiLocationEnabled === false) {
+                $errors[] = [
+                    'code' => 'INVENTORY_SITES_DISABLED',
+                    'message' => 'QuickBooks inventory-site tracking is disabled for this company.',
+                ];
+            } elseif ($multiLocationAvailable !== true || $multiLocationEnabled !== true) {
+                $errors[] = [
+                    'code' => 'INVENTORY_SITE_PREFERENCE_UNKNOWN',
+                    'message' => 'QuickBooks inventory-site availability or enabled status is unknown; verify the company preference before export.',
+                ];
+            }
+        }
+        $defaultTaxCodeIds = [];
+        if ($preparationMode === 'quickbooks_managed_defaults' && $preferencesAvailable) {
+            foreach (['defaultTaxableCode', 'defaultNonTaxableCode'] as $defaultField) {
+                $defaultListId = is_array($preferences[$defaultField] ?? null)
+                    ? $preferences[$defaultField]['listId'] ?? null
+                    : null;
+                if (
+                    !is_string($defaultListId)
+                    || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $defaultListId)
+                ) {
+                    $defaultTaxCodeIds = [];
+                    $errors[] = [
+                        'code' => 'TAX_DEFAULTS_UNVERIFIED',
+                        'message' => 'QuickBooks company tax defaults are missing or could not be verified; invoice tax behavior remains unverified.',
+                    ];
+                    break;
+                }
+                $defaultTaxCodeIds[$defaultListId] = $defaultListId;
+            }
+            if ($defaultTaxCodeIds && !$this->preflightListReferences(
+                'tax_code',
+                array_values($defaultTaxCodeIds),
+                'TAX_DEFAULTS_UNVERIFIED',
+                $errors
+            )) {
+                $errors[] = [
+                    'code' => 'TAX_DEFAULTS_UNVERIFIED',
+                    'message' => 'QuickBooks company tax defaults are missing or inactive; invoice tax behavior remains unverified.',
+                ];
+            }
         }
 
-        $customerResult = $this->diagnose('customer', [$customer]);
-        $customerRecord = $customerResult['response']['records'][0] ?? null;
-        if (
-            !($customerResult['available'] ?? false)
-            || !is_array($customerRecord)
-            || ($customerRecord['found'] ?? false) !== true
-            || ($customerRecord['active'] ?? null) !== true
-        ) {
+        if (isset($customerReference['listId'])) {
+            $customerRecords = $this->diagnose('customer', [$customerReference['listId']])['response']['records'] ?? null;
+            $customerRecord = is_array($customerRecords) ? ($customerRecords[0] ?? null) : null;
+            $customerValid = is_array($customerRecord)
+                && ($customerRecord['found'] ?? false) === true
+                && ($customerRecord['active'] ?? null) === true;
+        } else {
+            $customerResolution = $this->resolveExactFullName('customer', $customerReference['fullName']);
+            $customerValid = $customerResolution['listId'] !== null;
+            if (!$customerValid) {
+                $errors[] = [
+                    'code' => $customerResolution['code'],
+                    'message' => $customerResolution['message'],
+                    'entity' => 'customer',
+                    'reference' => $customerReference['fullName'],
+                    'diagnostic_code' => $customerResolution['diagnostic_code'] ?? null,
+                    'failure_stage' => $customerResolution['failure_stage'] ?? null,
+                    'sdk_error_code' => $customerResolution['sdk_error_code'] ?? null,
+                    'request_id' => $customerResolution['request_id'] ?? null,
+                    'shared_failure' => $customerResolution['shared_failure'] ?? false,
+                ];
+            }
+        }
+        if (!$customerValid && isset($customerReference['listId'])) {
             $errors[] = ['code' => 'CUSTOMER_REFERENCE_INVALID', 'message' => 'The verified QuickBooks customer is missing or inactive.'];
         }
 
         $itemIds = [];
+        $itemFullNames = [];
+        $resolvedItemIds = [];
         $taxIds = [];
         $sites = [];
         $unitRequired = [];
@@ -537,48 +659,107 @@ final class QuickBooksBridgeClient
                 $errors[] = ['code' => 'INVALID_SNAPSHOT', 'message' => 'A saved invoice line is invalid.'];
                 continue;
             }
-            $itemId = $line['item']['listId'] ?? null;
+            $itemReference = $line['item'] ?? null;
             $taxId = $line['salesTaxCode']['listId'] ?? null;
             $site = $line['site'] ?? null;
-            if (is_string($itemId)) {
-                $itemIds[$itemId] = $itemId;
-                if (trim((string)($line['unitOfMeasure'] ?? '')) !== '') {
-                    $unitRequired[$itemId] = $itemId;
+            if (is_array($itemReference) && $this->isValidInvoiceReference($itemReference, 'item')) {
+                if (isset($itemReference['listId'])) {
+                    $referenceKey = 'listId:' . $itemReference['listId'];
+                    $itemIds[$itemReference['listId']] = $itemReference['listId'];
+                } else {
+                    $referenceKey = 'fullName:' . $itemReference['fullName'];
+                    $itemFullNames[$itemReference['fullName']] = $itemReference['fullName'];
                 }
+                $unitRequired[$referenceKey] = $itemReference;
             }
-            if (is_string($taxId)) {
+            if ($preparationMode === 'legacy_mapped' && is_string($taxId)) {
                 $taxIds[$taxId] = $taxId;
             }
             if (is_string($site) && $site !== '') {
                 $sites[$site] = $site;
+            } else {
+                $errors[] = ['code' => 'SITE_REFERENCE_INVALID', 'message' => 'An exact QuickBooks inventory site is required for every invoice line.'];
             }
             $hasLots = $hasLots || trim((string)($line['lotNumber'] ?? '')) !== '';
             if (trim((string)($line['expirationDate'] ?? '')) !== '') {
                 $errors[] = ['code' => 'EXPIRATION_DATE_UNSUPPORTED', 'message' => 'Expiration dates are unsupported by the verified invoice-line mechanism.'];
             }
         }
-        if (!$this->preflightListReferences('item', array_values($itemIds), 'ITEM_REFERENCE_INVALID', $errors)) {
+        if ($itemIds && !$this->preflightListReferences('item', array_values($itemIds), 'ITEM_REFERENCE_INVALID', $errors)) {
             $errors[] = ['code' => 'ITEM_PREFLIGHT_FAILED', 'message' => 'QuickBooks item references could not all be verified.'];
         }
-        if (!$this->preflightListReferences('tax_code', array_values($taxIds), 'TAX_CODE_INVALID', $errors)) {
+        foreach (array_values($itemFullNames) as $fullName) {
+            $resolution = $this->resolveExactFullName('item', $fullName);
+            if ($resolution['listId'] === null) {
+                $errors[] = [
+                    'code' => $resolution['code'],
+                    'message' => $resolution['message'],
+                    'entity' => 'item',
+                    'reference' => $fullName,
+                    'diagnostic_code' => $resolution['diagnostic_code'] ?? null,
+                    'failure_stage' => $resolution['failure_stage'] ?? null,
+                    'sdk_error_code' => $resolution['sdk_error_code'] ?? null,
+                    'request_id' => $resolution['request_id'] ?? null,
+                    'shared_failure' => $resolution['shared_failure'] ?? false,
+                ];
+                continue;
+            }
+            $resolvedItemIds['fullName:' . $fullName] = $resolution['listId'];
+        }
+        foreach (array_values($itemIds) as $listId) {
+            $resolvedItemIds['listId:' . $listId] = $listId;
+        }
+        if ($preparationMode === 'legacy_mapped'
+            && !$this->preflightListReferences('tax_code', array_values($taxIds), 'TAX_CODE_INVALID', $errors)) {
             $errors[] = ['code' => 'TAX_PREFLIGHT_FAILED', 'message' => 'QuickBooks sales-tax references could not all be verified.'];
         }
         foreach (array_values($sites) as $site) {
             $siteResult = $this->lookupInventorySiteFullName($site);
             $records = $siteResult['response']['records'] ?? null;
-            if (
-                !($siteResult['available'] ?? false)
-                || !is_array($records)
-                || count($records) !== 1
-                || ($records[0]['fullName'] ?? null) !== $site
-                || ($records[0]['active'] ?? null) !== true
-            ) {
-                $errors[] = ['code' => 'SITE_REFERENCE_INVALID', 'message' => 'A QuickBooks inventory site does not match the saved invoice line exactly or is inactive.'];
+            $siteError = null;
+            $siteMessage = null;
+            if (!($siteResult['available'] ?? false) || !is_array($records)) {
+                $siteError = 'SITE_QUERY_FAILED';
+                $siteMessage = 'QuickBooks could not complete the read-only inventory-site query; the saved Site has not been verified.';
+            } elseif (count($records) === 0) {
+                $siteError = 'SITE_NOT_FOUND';
+                $siteMessage = 'No QuickBooks inventory Site has the saved FullName.';
+            } elseif (count($records) > 1) {
+                $siteError = 'SITE_FULLNAME_AMBIGUOUS';
+                $siteMessage = 'More than one QuickBooks inventory Site matched the saved FullName.';
+            } elseif (($records[0]['fullName'] ?? null) !== $site) {
+                $siteError = 'SITE_FULLNAME_MISMATCH';
+                $siteMessage = 'The returned QuickBooks inventory Site FullName does not exactly match the saved Site.';
+            } elseif (($records[0]['active'] ?? null) === false) {
+                $siteError = 'SITE_INACTIVE';
+                $siteMessage = 'The exact QuickBooks inventory Site is inactive.';
+            } elseif (($records[0]['active'] ?? null) !== true) {
+                $siteError = 'SITE_ACTIVE_STATUS_UNKNOWN';
+                $siteMessage = 'QuickBooks returned the exact inventory Site but did not verify that it is active.';
+            }
+            if ($siteError !== null) {
+                $errors[] = [
+                    'code' => $siteError,
+                    'message' => $siteMessage,
+                    'entity' => 'inventory_site',
+                    'reference' => $site,
+                    'diagnostic_code' => $siteResult['diagnostic_code'] ?? null,
+                    'failure_stage' => $siteResult['failure_stage'] ?? null,
+                    'sdk_error_code' => $siteResult['sdk_error_code'] ?? null,
+                    'request_id' => $siteResult['request_id'] ?? null,
+                    'shared_failure' => $siteError === 'SITE_QUERY_FAILED',
+                ];
                 break;
             }
         }
         if ($unitRequired) {
-            foreach (array_chunk(array_values($unitRequired), 50) as $batch) {
+            $unitListIds = [];
+            foreach ($unitRequired as $referenceKey => $_reference) {
+                if (isset($resolvedItemIds[$referenceKey])) {
+                    $unitListIds[$resolvedItemIds[$referenceKey]] = $resolvedItemIds[$referenceKey];
+                }
+            }
+            foreach (array_chunk(array_values($unitListIds), 50) as $batch) {
                 $unitsResult = $this->diagnose('item_uom', $batch);
                 $records = $unitsResult['response']['records'] ?? null;
                 if (!($unitsResult['available'] ?? false) || !is_array($records)) {
@@ -590,9 +771,8 @@ final class QuickBooksBridgeClient
                         !is_array($record)
                         || ($record['found'] ?? false) !== true
                         || ($record['active'] ?? null) !== true
-                        || ($record['unitSetActive'] ?? null) !== true
                     ) {
-                        $errors[] = ['code' => 'UNIT_OF_MEASURE_INVALID', 'message' => 'A QuickBooks item unit set is missing or inactive.'];
+                        $errors[] = ['code' => 'UNIT_OF_MEASURE_INVALID', 'message' => 'A QuickBooks item or unit-set query could not be verified.'];
                         break 2;
                     }
                     $unitRecords[$record['listId']] = $record;
@@ -600,24 +780,43 @@ final class QuickBooksBridgeClient
             }
             foreach ($lines as $line) {
                 $unit = trim((string)($line['unitOfMeasure'] ?? ''));
-                if ($unit === '') {
+                $reference = $line['item'];
+                $referenceKey = isset($reference['listId'])
+                    ? 'listId:' . $reference['listId']
+                    : 'fullName:' . $reference['fullName'];
+                $record = $unitRecords[$resolvedItemIds[$referenceKey] ?? ''] ?? null;
+                $unitSetId = is_array($record) ? trim((string)($record['unitSetListId'] ?? '')) : '';
+                if ($unitSetId === '') {
+                    if ($unit !== '') {
+                        $errors[] = ['code' => 'UNIT_OF_MEASURE_INVALID', 'message' => 'The saved unit does not exist in the QuickBooks item master.'];
+                        break;
+                    }
                     continue;
                 }
-                $record = $unitRecords[$line['item']['listId']] ?? null;
                 $unitNames = is_array($record['units'] ?? null)
                     ? array_column($record['units'], 'name')
                     : [];
                 if (
                     !is_array($record)
+                    || ($record['unitSetActive'] ?? null) !== true
+                    || !is_string($record['salesDefaultUnit'] ?? null)
+                    || trim($record['salesDefaultUnit']) === ''
+                    || $unit === ''
+                    || $unit !== $record['salesDefaultUnit']
                     || ($record['salesDefaultUnit'] ?? null) !== $unit
                     || !in_array($unit, $unitNames, true)
                 ) {
-                    $errors[] = ['code' => 'UNIT_OF_MEASURE_INVALID', 'message' => 'The saved unit does not match the active QuickBooks item sales unit.'];
+                    $errors[] = [
+                        'code' => $unit === '' ? 'UNIT_OF_MEASURE_REQUIRED' : 'UNIT_OF_MEASURE_INVALID',
+                        'message' => $unit === ''
+                            ? 'The QuickBooks item uses a unit set; provide its verified sales unit to preserve quantity meaning.'
+                            : 'The saved unit does not match the active QuickBooks item sales unit.',
+                    ];
                     break;
                 }
             }
         }
-        if ($hasLots && (!is_array($preferences) || ($preferences['lotTracking'] ?? null) !== 'LotNumber')) {
+        if ($hasLots && (!$preferencesAvailable || ($preferences['lotTracking'] ?? null) !== 'LotNumber')) {
             $errors[] = ['code' => 'LOT_TRACKING_UNAVAILABLE', 'message' => 'QuickBooks lot-number tracking is not enabled or verified.'];
         }
         return ['ready' => $errors === [], 'errors' => $errors];
@@ -657,6 +856,78 @@ final class QuickBooksBridgeClient
     private function isNullableString(mixed $value, int $maxLength): bool
     {
         return $value === null || (is_string($value) && mb_strlen($value) <= $maxLength);
+    }
+
+    private function isValidInvoiceReference(array $reference, string $entity): bool
+    {
+        if (count($reference) !== 1) {
+            return false;
+        }
+        if (isset($reference['listId'])) {
+            return is_string($reference['listId'])
+                && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $reference['listId']) === 1;
+        }
+        $fullName = $reference['fullName'] ?? null;
+        $maximumLength = $entity === 'customer' ? 209 : 159;
+        return is_string($fullName)
+            && trim($fullName) !== ''
+            && $fullName === trim($fullName)
+            && mb_strlen($fullName) <= $maximumLength
+            && preg_match('/[\x00-\x1F\x7F]/', $fullName) !== 1;
+    }
+
+    private function resolveExactFullName(string $entity, string $fullName): array
+    {
+        $result = $this->lookupName($entity, $fullName);
+        $records = $result['response']['records'] ?? null;
+        if (!($result['available'] ?? false) || !is_array($records)) {
+            return [
+                'listId' => null,
+                'code' => strtoupper($entity) . '_FULLNAME_LOOKUP_UNAVAILABLE',
+                'message' => 'The signed, company-bound QuickBooks FullName query could not be completed; this reference has not been verified.',
+                'diagnostic_code' => $result['diagnostic_code'] ?? null,
+                'failure_stage' => $result['failure_stage'] ?? null,
+                'sdk_error_code' => $result['sdk_error_code'] ?? null,
+                'request_id' => $result['request_id'] ?? null,
+                'shared_failure' => true,
+            ];
+        }
+        $matches = array_values(array_filter(
+            $records,
+            static fn($record): bool => is_array($record)
+                && ($record['fullName'] ?? null) === $fullName
+        ));
+        if (count($matches) !== 1) {
+            $ambiguous = count($matches) > 1;
+            return [
+                'listId' => null,
+                'code' => strtoupper($entity) . '_FULLNAME_' . ($ambiguous ? 'AMBIGUOUS' : 'NOT_FOUND'),
+                'message' => $ambiguous
+                    ? 'The exact QuickBooks FullName matches more than one company record.'
+                    : 'No QuickBooks record has the exact requested FullName.',
+            ];
+        }
+        if (($matches[0]['active'] ?? null) !== true) {
+            $inactive = ($matches[0]['active'] ?? null) === false;
+            return [
+                'listId' => null,
+                'code' => strtoupper($entity) . ($inactive ? '_FULLNAME_INACTIVE' : '_FULLNAME_ACTIVE_STATUS_UNKNOWN'),
+                'message' => $inactive
+                    ? 'The exact QuickBooks FullName record is inactive.'
+                    : 'QuickBooks did not verify the active status of the exact FullName record.',
+            ];
+        }
+        if (
+            !is_string($matches[0]['listId'] ?? null)
+            || !preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $matches[0]['listId'])
+        ) {
+            return [
+                'listId' => null,
+                'code' => strtoupper($entity) . '_FULLNAME_INVALID',
+                'message' => 'The exact QuickBooks FullName record did not include a valid internal ListID.',
+            ];
+        }
+        return ['listId' => $matches[0]['listId'], 'code' => null, 'message' => null];
     }
 
     private function isValidCompanyIdentity(mixed $identity): bool
@@ -927,6 +1198,139 @@ final class QuickBooksBridgeClient
         return true;
     }
 
+    private function isValidReferenceScan(array $categories): bool
+    {
+        $expected = [
+            'customers' => ['scope' => 'customer', 'limit' => 100],
+            'items' => ['scope' => 'item', 'limit' => 100],
+            'inventory_sites' => ['scope' => 'local_exact_names', 'limit' => 20],
+            'mapped_item_units' => ['scope' => 'saved_item_list_ids', 'limit' => 20],
+            'saved_tax_codes' => ['scope' => 'saved_tax_code_list_ids', 'limit' => 20],
+            'company_preferences' => ['scope' => 'company_preferences', 'limit' => 1],
+        ];
+        if (count($categories) !== count($expected)) {
+            return false;
+        }
+        foreach ($categories as $category) {
+            $fields = ['category', 'scope', 'status', 'diagnosticCode', 'recordCount', 'limit', 'records'];
+            if (
+                !is_array($category)
+                || array_is_list($category)
+                || array_diff(array_keys($category), $fields)
+                || array_diff($fields, array_keys($category))
+                || !is_string($category['category'])
+                || !isset($expected[$category['category']])
+                || $category['scope'] !== $expected[$category['category']]['scope']
+                || !in_array($category['status'], ['complete', 'partial', 'failed'], true)
+                || (!is_null($category['diagnosticCode'])
+                    && (!is_string($category['diagnosticCode'])
+                        || !preg_match('/^[A-Z0-9_]{1,80}$/D', $category['diagnosticCode'])))
+                || !is_int($category['recordCount'])
+                || !is_int($category['limit'])
+                || $category['limit'] !== $expected[$category['category']]['limit']
+                || !is_array($category['records'])
+                || !array_is_list($category['records'])
+                || $category['recordCount'] !== count($category['records'])
+                || count($category['records']) > $category['limit']
+                || ($category['status'] === 'failed'
+                    && ($category['recordCount'] !== 0 || $category['diagnosticCode'] === null))
+                || ($category['status'] === 'complete' && $category['diagnosticCode'] !== null)
+                || ($category['status'] === 'partial'
+                    && $category['diagnosticCode'] !== 'SCAN_LIMIT_REACHED')
+            ) {
+                return false;
+            }
+            foreach ($category['records'] as $record) {
+                if (!$this->isValidReferenceScanRecord($category['category'], $record)) {
+                    return false;
+                }
+            }
+        }
+        return count(array_unique(array_column($categories, 'category'), SORT_STRING)) === count($expected);
+    }
+
+    private function isValidReferenceScanRecord(string $category, mixed $record): bool
+    {
+        if (!is_array($record) || array_is_list($record)) {
+            return false;
+        }
+        if ($category === 'customers') {
+            $fields = ['listId', 'name', 'fullName', 'active', 'companyName', 'customerType'];
+            return !array_diff(array_keys($record), $fields)
+                && !array_diff($fields, array_keys($record))
+                && is_string($record['listId'])
+                && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId'])
+                && is_string($record['name'])
+                && trim($record['name']) !== ''
+                && mb_strlen($record['name']) <= 41
+                && is_string($record['fullName'])
+                && trim($record['fullName']) !== ''
+                && mb_strlen($record['fullName']) <= 209
+                && (is_bool($record['active']) || $record['active'] === null)
+                && $this->isNullableString($record['companyName'], 41)
+                && $this->isNullableString($record['customerType'], 159);
+        }
+        if ($category === 'items') {
+            $fields = ['listId', 'name', 'fullName', 'active', 'itemType', 'manufacturerPartNumber', 'unitSetListId', 'unitSetName'];
+            return !array_diff(array_keys($record), $fields)
+                && !array_diff($fields, array_keys($record))
+                && is_string($record['listId'])
+                && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId'])
+                && is_string($record['name'])
+                && trim($record['name']) !== ''
+                && mb_strlen($record['name']) <= 31
+                && is_string($record['fullName'])
+                && trim($record['fullName']) !== ''
+                && mb_strlen($record['fullName']) <= 159
+                && (is_bool($record['active']) || $record['active'] === null)
+                && is_string($record['itemType'])
+                && preg_match('/^Item[A-Za-z]{1,30}$/D', $record['itemType'])
+                && $this->isNullableString($record['manufacturerPartNumber'], 31)
+                && $this->isNullableString($record['unitSetListId'], 100)
+                && ($record['unitSetListId'] === null
+                    || preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['unitSetListId']))
+                && $this->isNullableString($record['unitSetName'], 159);
+        }
+        if ($category === 'inventory_sites') {
+            $fields = ['listId', 'name', 'fullName', 'found', 'active'];
+            return !array_diff(array_keys($record), $fields)
+                && !array_diff($fields, array_keys($record))
+                && is_string($record['listId'])
+                && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId'])
+                && is_string($record['name'])
+                && mb_strlen($record['name']) <= 31
+                && is_string($record['fullName'])
+                && mb_strlen($record['fullName']) <= 255
+                && is_bool($record['found'])
+                && $record['found'] === true
+                && (is_bool($record['active']) || $record['active'] === null);
+        }
+        if ($category === 'mapped_item_units') {
+            return is_string($record['listId'] ?? null)
+                && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId'])
+                && $this->isValidUnitRecord($record, $record['listId']);
+        }
+        if ($category === 'saved_tax_codes') {
+            if (($record['found'] ?? null) === false) {
+                return array_keys($record) === ['listId', 'found']
+                    && is_string($record['listId'])
+                    && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId']);
+            }
+            $fields = ['listId', 'name', 'active', 'found'];
+            return !array_diff(array_keys($record), $fields)
+                && !array_diff($fields, array_keys($record))
+                && is_string($record['listId'])
+                && preg_match('/^[A-Za-z0-9._:-]{1,100}$/D', $record['listId'])
+                && is_bool($record['found'])
+                && (!$record['found']
+                    || (is_string($record['name'])
+                        && mb_strlen($record['name']) <= 31
+                        && (is_bool($record['active']) || $record['active'] === null)));
+        }
+        return $category === 'company_preferences'
+            && $this->isValidCompanyPreferences($record);
+    }
+
     private function request(string $operation, array $payload, int $timeout = 5): array
     {
         if (!in_array($operation, ['health', 'validate', 'diagnose', 'submit'], true)) {
@@ -1185,6 +1589,8 @@ final class QuickBooksBridgeClient
             'records',
             'qbxmlVersion',
             'searchName',
+            'failureStage',
+            'sdkErrorCode',
             'outcome',
             'txnId',
             'txnNumber',
@@ -1227,14 +1633,43 @@ final class QuickBooksBridgeClient
         }
         if ($operation === 'diagnose' && is_array($decoded) && is_string($decoded['status'] ?? null)) {
             $invalidDiagnosis = false;
+            if ($decoded['status'] !== 'ok') {
+                $failureStages = [
+                    'worker_request_read',
+                    'worker_request_parse',
+                    'worker_request_validation',
+                    'sdk_diagnostic',
+                    'worker_response_serialization',
+                    'sdk_session_mutex',
+                    'request_processor_activation',
+                    'open_connection',
+                    'begin_session',
+                    'get_current_company_file',
+                    'qbxml_version_negotiation',
+                    'company_identity_query',
+                    'company_preferences_query',
+                    'invoice_custom_fields_query',
+                    'item_uom_query',
+                    'reference_scan_query',
+                    'reference_query',
+                    'diagnostic_worker_timeout',
+                    'diagnostic_worker_response',
+                    'diagnostic_worker_launch',
+                ];
+                $invalidDiagnosis = (array_key_exists('failureStage', $decoded)
+                        && !in_array($decoded['failureStage'], $failureStages, true))
+                    || (array_key_exists('sdkErrorCode', $decoded)
+                        && (!is_string($decoded['sdkErrorCode'])
+                            || !preg_match('/^SDK_COM_[A-F0-9]{8}$/D', $decoded['sdkErrorCode'])));
+            }
             if ($decoded['status'] === 'ok') {
                 $records = $decoded['records'] ?? null;
                 if ($expectedSearchName !== null) {
                     $expectedFields = $expectedEntity === 'customer'
-                        ? ['listId', 'name', 'fullName', 'companyName', 'active']
+                        ? ['listId', 'name', 'fullName', 'companyName', 'active', 'found']
                         : ($expectedEntity === 'item'
-                            ? ['listId', 'name', 'fullName', 'manufacturerPartNumber', 'salesDescription', 'active']
-                            : ['listId', 'name', 'fullName', 'active']);
+                            ? ['listId', 'name', 'fullName', 'manufacturerPartNumber', 'salesDescription', 'active', 'found']
+                            : ['listId', 'name', 'fullName', 'active', 'found']);
                     $invalidDiagnosis = ($decoded['entity'] ?? null) !== $expectedEntity
                         || ($decoded['searchName'] ?? null) !== $expectedSearchName
                         || !is_array($records)
@@ -1262,8 +1697,8 @@ final class QuickBooksBridgeClient
                                 || !is_string($record['fullName'] ?? null)
                                 || trim($record['fullName']) === ''
                                 || mb_strlen($record['fullName']) > ($expectedEntity === 'customer' ? 209 : 159)
+                                || ($record['found'] ?? null) !== true
                                 || (!is_bool($record['active'] ?? null) && !is_null($record['active']))
-                                || ($expectedEntity === 'inventory_site' && $record['fullName'] !== $expectedSearchName)
                                 || ($expectedEntity === 'customer'
                                     && !is_null($record['companyName'])
                                     && (!is_string($record['companyName']) || mb_strlen($record['companyName']) > 41))
@@ -1279,7 +1714,7 @@ final class QuickBooksBridgeClient
                         }
                     }
                 } elseif ($expectedListIds === null) {
-                    $invalidDiagnosis = !in_array($expectedEntity, ['company_preferences', 'invoice_custom_fields'], true)
+                    $invalidDiagnosis = !in_array($expectedEntity, ['company_preferences', 'invoice_custom_fields', 'reference_scan'], true)
                         || ($decoded['entity'] ?? null) !== $expectedEntity
                         || !is_array($records)
                         || !array_is_list($records)
@@ -1292,7 +1727,9 @@ final class QuickBooksBridgeClient
                     if (!$invalidDiagnosis) {
                         $invalidDiagnosis = $expectedEntity === 'company_preferences'
                             ? count($records) !== 1 || !$this->isValidCompanyPreferences($records[0] ?? null)
-                            : count($records) > 100 || !$this->areValidInvoiceCustomFields($records);
+                            : ($expectedEntity === 'invoice_custom_fields'
+                                ? count($records) > 100 || !$this->areValidInvoiceCustomFields($records)
+                                : !$this->isValidReferenceScan($records));
                     }
                 } else {
                     $invalidDiagnosis = ($decoded['entity'] ?? null) !== $expectedEntity
@@ -1373,6 +1810,12 @@ final class QuickBooksBridgeClient
                 'message' => is_string($decoded['message'] ?? null)
                     ? $decoded['message']
                     : 'The local bridge returned a signed unavailable or error response.',
+                'failure_stage' => is_string($decoded['failureStage'] ?? null)
+                    ? $decoded['failureStage']
+                    : null,
+                'sdk_error_code' => is_string($decoded['sdkErrorCode'] ?? null)
+                    ? $decoded['sdkErrorCode']
+                    : null,
                 'outcome' => $decoded['outcome'] ?? null,
                 'http_status' => $status,
                 'signed_response' => true,

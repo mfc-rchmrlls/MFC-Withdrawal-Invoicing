@@ -98,6 +98,57 @@ function product_codes_match(mixed $itemCode, mixed $qbCode): bool
     return strcasecmp($itemCode, $qbCode) === 0;
 }
 
+function invoice_draft_revision(array $invoice, array $lines): string
+{
+    $headerKeys = [
+        'id',
+        'withdrawal_id',
+        'customer_id',
+        'invoice_number',
+        'invoice_date',
+        'po_no',
+        'memo',
+        'status',
+    ];
+    $lineKeys = [
+        'id',
+        'withdrawal_item_id',
+        'source_type',
+        'product_id',
+        'site_id',
+        'product_name',
+        'quantity',
+        'lot_number',
+        'item_code',
+        'description',
+        'u_m',
+        'price_each',
+        'amount',
+        'price_source',
+        'tax_code',
+        'expiration_date',
+    ];
+    $normalize = static function (array $record, array $keys): array {
+        $normalized = [];
+        foreach ($keys as $key) {
+            $normalized[$key] = isset($record[$key]) ? (string)$record[$key] : null;
+        }
+        return $normalized;
+    };
+    $normalizedLines = array_map(
+        static fn(array $line): array => $normalize($line, $lineKeys),
+        array_values($lines)
+    );
+
+    return hash('sha256', json_encode(
+        [
+            'invoice' => $normalize($invoice, $headerKeys),
+            'lines' => $normalizedLines,
+        ],
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+    ));
+}
+
 function withdrawal_product_label(string $name, ?string $description): string
 {
     $name = trim($name);

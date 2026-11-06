@@ -91,7 +91,7 @@ function test_database(): PDO
     $pdo->exec('CREATE TABLE sites (id INTEGER PRIMARY KEY, site_name TEXT, active INTEGER)');
     $pdo->exec('CREATE TABLE withdrawals (id INTEGER PRIMARY KEY, withdrawal_no TEXT)');
     $pdo->exec('CREATE TABLE invoices (id INTEGER PRIMARY KEY, withdrawal_id INTEGER, customer_id INTEGER, invoice_number TEXT, invoice_date TEXT, po_no TEXT, memo TEXT, status TEXT)');
-    $pdo->exec('CREATE TABLE invoice_items (id INTEGER PRIMARY KEY, invoice_id INTEGER, withdrawal_item_id INTEGER, source_type TEXT, product_id INTEGER, site_id INTEGER, product_name TEXT, quantity INTEGER, lot_number TEXT, item_code TEXT, description TEXT, u_m TEXT, price_each TEXT, amount TEXT, tax_code TEXT, expiration_date TEXT)');
+    $pdo->exec('CREATE TABLE invoice_items (id INTEGER PRIMARY KEY, invoice_id INTEGER, withdrawal_item_id INTEGER, source_type TEXT, product_id INTEGER, site_id INTEGER, product_name TEXT, quantity INTEGER, lot_number TEXT, item_code TEXT, description TEXT, u_m TEXT, price_each TEXT, amount TEXT, price_source TEXT, tax_code TEXT, expiration_date TEXT)');
     $pdo->exec('CREATE TABLE sales_orders (id INTEGER PRIMARY KEY, withdrawal_id INTEGER, customer_id INTEGER, qb_customer_list_id TEXT, so_number TEXT, sales_order_date TEXT, po_no TEXT, memo TEXT, status TEXT)');
     $pdo->exec('CREATE TABLE sales_order_items (id INTEGER PRIMARY KEY, sales_order_id INTEGER, line_no INTEGER, product_id INTEGER, site_id INTEGER, item_name TEXT, ordered_quantity INTEGER, lot_number TEXT, item_code TEXT, description TEXT, u_m TEXT, rate TEXT, amount TEXT, tax_code TEXT, expiration_date TEXT, class_name TEXT, line_status TEXT, fulfilled_quantity INTEGER, qb_item_list_id TEXT)');
     $pdo->exec('CREATE TABLE qb_jobs (id INTEGER PRIMARY KEY, invoice_id INTEGER)');
@@ -108,7 +108,7 @@ function test_database(): PDO
     $pdo->exec("INSERT INTO sites VALUES (1,'Example Site',1)");
     $pdo->exec("INSERT INTO withdrawals VALUES (1,'W-1')");
     $pdo->exec("INSERT INTO invoices VALUES (1,1,1,'INV-1','2026-10-23','PO-1',NULL,'Draft')");
-    $pdo->exec("INSERT INTO invoice_items VALUES (1,1,NULL,'WITHDRAWAL',1,1,'Example Product',2,'LOT-1','ITEM-CODE-1','Approved description','BOX','10.00','20.00','Tax','2026-12-31')");
+    $pdo->exec("INSERT INTO invoice_items VALUES (1,1,NULL,'WITHDRAWAL',1,1,'Example Product',2,'LOT-1','ITEM-CODE-1','Approved description','BOX','10.00','20.00','mfc_entered','Tax','2026-12-31')");
     $pdo->exec('INSERT INTO employees VALUES (2,"Employee",1)');
     $pdo->exec("INSERT INTO sales_orders VALUES (1,1,1,'CUST-LIST-1','SO-1','2026-10-23','PO-1',NULL,'Draft')");
     $pdo->exec("INSERT INTO sales_order_items VALUES (1,1,1,1,1,'Example Product',2,'','ITEM-CODE-1','Approved description','', '10.00','20.00','Tax',NULL,NULL,NULL,NULL,'ITEM-LIST-1')");
@@ -134,9 +134,11 @@ try {
 
     $invoice = qb_export_validate($pdo, 'invoice', 1);
     test_assert(!$invoice['valid'] && $invoice['transaction']['transaction_type'] === 'invoice', 'invoice preview is explicitly typed');
-    test_assert(test_has_error($invoice, 'CUSTOMER_MAPPING_UNVERIFIED'), 'missing verified customer mapping blocks export');
-    test_assert(test_has_error($invoice, 'ITEM_MAPPING_UNVERIFIED'), 'missing verified item mapping blocks export');
-    test_assert(test_has_error($invoice, 'TAX_MAPPING_UNVERIFIED'), 'missing approved tax mapping blocks export');
+    test_assert(test_has_error($invoice, 'CUSTOMER_MAPPING_UNVERIFIED'), 'unverified stored customer ListID cannot fall back to a name');
+    test_assert(test_has_error($invoice, 'ITEM_MAPPING_UNVERIFIED'), 'unverified stored item ListID cannot fall back to a name');
+    test_assert(!test_has_error($invoice, 'TAX_MAPPING_UNVERIFIED')
+        && $invoice['transaction']['preparation_mode'] === 'quickbooks_managed_defaults',
+        'invoice managed-defaults mode does not require per-line tax mappings');
     test_assert(!test_has_error($invoice, 'SITE_DESTINATION_UNVERIFIED')
         && $invoice['transaction']['lines'][0]['site_mapping_status'] === 'unresolved',
         'invoice Site references remain pending exact live-company verification');
@@ -146,10 +148,82 @@ try {
     test_assert(!test_has_error($invoice, 'TAX_TOTAL_UNRESOLVED'), 'QuickBooks-calculated sales tax is gated by verified tax codes and company preferences');
     test_assert(test_has_error($invoice, 'LEGACY_JOB_EXISTS') === false, 'invoice export is independent when no legacy qb_jobs record exists');
     test_assert($invoice['transaction']['expected_subtotal'] === '20.00', 'expected invoice subtotal is calculated from quantity and rate');
+    $pdo->exec("UPDATE invoice_items SET quantity=10,price_each='150.00',amount='1500.00' WHERE id=1");
+    $enteredPrice = qb_export_validate($pdo, 'invoice', 1);
+    test_assert($enteredPrice['transaction']['lines'][0]['rate'] === '150.00'
+        && $enteredPrice['transaction']['lines'][0]['expected_amount'] === '1500.00'
+        && $enteredPrice['transaction']['lines'][0]['pricing_status'] === 'MFC-entered price',
+        'an explicit MFC price takes priority and uses exact quantity-times-rate cents');
+    $pdo->exec("UPDATE invoice_items SET quantity=2,price_each='10.00',amount='20.00' WHERE id=1");
+    $pdo->exec("UPDATE invoice_items SET price_each=NULL,amount=NULL,price_source='quickbooks_pending' WHERE id=1");
+    $pendingPrice = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(test_has_error($pendingPrice, 'PRICE_UNRESOLVED')
+        && $pendingPrice['transaction']['expected_subtotal'] === 'unresolved pricing'
+        && !test_has_error($pendingPrice, 'ZERO_RATE_UNAPPROVED'),
+        'a blank price remains distinct from zero and blocks queueing');
+    $pdo->exec("UPDATE invoice_items SET price_each='10.00',amount='20.00',price_source='mfc_entered' WHERE id=1");
+    $pdo->exec("UPDATE invoice_items SET price_each='0.00',amount='0.00',price_source='explicit_zero' WHERE id=1");
+    $explicitZero = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(!test_has_error($explicitZero, 'ZERO_RATE_UNAPPROVED')
+        && !test_has_error($explicitZero, 'PRICE_UNRESOLVED')
+        && $explicitZero['transaction']['lines'][0]['rate'] === '0.00'
+        && $explicitZero['transaction']['lines'][0]['expected_amount'] === '0.00'
+        && $explicitZero['transaction']['lines'][0]['pricing_status'] === 'Explicit zero — valid'
+        && $explicitZero['transaction']['expected_subtotal'] === '0.00',
+        'an explicit zero-priced invoice line is valid and retains a zero rate and amount');
+    $pdo->exec("UPDATE invoice_items SET price_source='mfc_entered' WHERE id=1");
+    $legacyZero = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(!test_has_error($legacyZero, 'ZERO_RATE_UNAPPROVED')
+        && $legacyZero['transaction']['lines'][0]['rate'] === '0.00'
+        && $legacyZero['transaction']['lines'][0]['expected_amount'] === '0.00',
+        'a saved zero rate tagged as MFC-entered remains exportable for legacy compatibility');
+    $pdo->exec("UPDATE invoice_items SET price_source='explicit_zero' WHERE id=1");
+    $pdo->exec("INSERT INTO invoice_items VALUES (2,1,NULL,'ADDITIONAL',1,1,'Example Product',20,'','ITEM-CODE-1','Approved description','BOX','0.00','0.00','explicit_zero','Tax',NULL)");
+    $multipleZero = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(count($multipleZero['transaction']['lines']) === 2
+        && $multipleZero['transaction']['expected_subtotal'] === '0.00'
+        && array_column($multipleZero['transaction']['lines'], 'expected_amount') === ['0.00', '0.00'],
+        'multiple zero-priced invoice lines remain present in their original order with zero amounts');
+    $pdo->exec("UPDATE invoice_items SET price_each='150.00',amount='3000.00',price_source='mfc_entered' WHERE id=2");
+    $mixedPrices = qb_export_validate($pdo, 'invoice', 1);
+    test_assert($mixedPrices['transaction']['expected_subtotal'] === '3000.00'
+        && array_column($mixedPrices['transaction']['lines'], 'rate') === ['0.00', '150.00']
+        && array_column($mixedPrices['transaction']['lines'], 'expected_amount') === ['0.00', '3000.00'],
+        'mixed zero and positive invoice rates preserve line order and reconcile their amounts');
+    $pdo->exec('DELETE FROM invoice_items WHERE id=2');
+    $pdo->exec("UPDATE invoice_items SET price_each='0.00',amount='0.00',price_source='unresolved' WHERE id=1");
+    $historicalZero = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(test_has_error($historicalZero, 'PRICE_SOURCE_UNRESOLVED')
+        && $historicalZero['transaction']['lines'][0]['rate'] === '0.00'
+        && $historicalZero['transaction']['lines'][0]['saved_amount'] === '0.00'
+        && !test_has_error($historicalZero, 'ZERO_RATE_UNAPPROVED'),
+        'a historical unresolved zero is preserved but blocked until intent is explicitly confirmed');
+    $pdo->exec("UPDATE invoice_items SET price_each='10.00',amount='20.00',price_source='mfc_entered' WHERE id=1");
     test_assert($invoice['transaction']['tax_total'] === null
         && $invoice['transaction']['expected_total'] === null
-        && str_contains($invoice['transaction']['tax_total_status'], 'QuickBooks calculates tax'),
-        'invoice tax is explicitly delegated to QuickBooks after live tax-code preflight');
+        && str_contains($invoice['transaction']['tax_total_status'], 'live verification'),
+        'invoice tax defaults remain explicitly unverified until live behavior is checked');
+    test_assert(test_has_error(qb_export_validate($pdo, 'invoice', 1, null, 'legacy_mapped'), 'TAX_MAPPING_UNVERIFIED'),
+        'legacy invoice mode continues to require its approved tax mapping');
+    $pdo->exec('UPDATE clients SET qb_list_id=NULL WHERE id=1');
+    $pdo->exec('UPDATE products SET qb_list_id=NULL WHERE id=1');
+    $fullnamePreview = qb_export_validate($pdo, 'invoice', 1);
+    test_assert($fullnamePreview['transaction']['customer_full_name'] === 'Example Customer'
+        && $fullnamePreview['transaction']['customer_list_id'] === null
+        && $fullnamePreview['transaction']['lines'][0]['item_full_name'] === 'ITEM-CODE-1'
+        && $fullnamePreview['transaction']['lines'][0]['item_list_id'] === null,
+        'invoice snapshots keep missing-ListID customer and item FullName candidates distinct from ListIDs');
+    $pdo->exec("UPDATE invoice_items SET item_code='' WHERE id=1");
+    $pdo->exec("UPDATE products SET qb_code='' WHERE id=1");
+    test_assert(test_has_error(qb_export_validate($pdo, 'invoice', 1), 'ITEM_MAPPING_UNVERIFIED'),
+        'a local product description is not substituted for a missing Item Code FullName candidate');
+    $pdo->exec("UPDATE products SET qb_code='ITEM-CODE-1' WHERE id=1");
+    $currentCodePreview = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(($currentCodePreview['transaction']['lines'][0]['item_full_name'] ?? null) === 'ITEM-CODE-1',
+        'the current Product Master QB Code is used only when the saved invoice Item Code is blank');
+    $pdo->exec("UPDATE invoice_items SET item_code='ITEM-CODE-1' WHERE id=1");
+    $pdo->exec("UPDATE clients SET qb_list_id='CUST-LIST-1' WHERE id=1");
+    $pdo->exec("UPDATE products SET qb_list_id='ITEM-LIST-1' WHERE id=1");
 
     $pdo->prepare('UPDATE invoices SET invoice_number=? WHERE id=1')->execute([str_repeat('R', 12)]);
     test_assert(test_has_error(qb_export_validate($pdo, 'invoice', 1), 'REFERENCE_NUMBER_TOO_LONG'),
@@ -203,7 +277,11 @@ try {
          VALUES('customer','client:1','CUST-LIST-1','Example Customer','2020-01-01 12:00:00',
           1,'" . str_repeat('b', 64) . "','" . qb_export_uuid() . "',NULL,1)"
     );
-    test_assert(test_has_error(qb_export_validate($pdo, 'invoice', 1), 'CUSTOMER_MAPPING_UNVERIFIED'), 'an unsigned arbitrary verification row cannot approve a ListID');
+    $unsignedMappingPreview = qb_export_validate($pdo, 'invoice', 1);
+    test_assert(test_has_error($unsignedMappingPreview, 'CUSTOMER_MAPPING_UNVERIFIED')
+        && $unsignedMappingPreview['transaction']['customer_list_id'] === null
+        && !isset($unsignedMappingPreview['transaction']['customer_full_name']),
+        'an unsigned arbitrary verification row cannot approve a stored ListID or silently switch it to FullName mode');
     $pdo->exec('DELETE FROM qb_export_reference_verifications');
     test_add_verification($pdo, 'customer', 'client:1', 'CUST-LIST-1');
     test_add_verification($pdo, 'item', 'product:1', 'ITEM-LIST-1');
@@ -445,6 +523,7 @@ try {
         'requestId' => qb_export_uuid(),
         'operation' => 'submit',
         'transactionType' => 'invoice',
+        'preparationMode' => 'legacy_mapped',
         'idempotencyKey' => str_repeat('a', 64),
         'source' => ['id' => 1, 'revision' => str_repeat('a', 64)],
         'transaction' => [
@@ -459,6 +538,7 @@ try {
                 'quantity' => '2',
                 'rate' => '10.00',
                 'expectedAmount' => '20.00',
+                'pricingSource' => 'mfc_entered',
                 'salesTaxCode' => ['listId' => 'TAX-LIST-1'],
                 'site' => 'Main Site',
                 'lotNumber' => null,
@@ -576,6 +656,7 @@ try {
                     'fullName' => 'Example Customer',
                     'companyName' => 'Example Company, Inc.',
                     'active' => true,
+                    'found' => true,
                 ]],
                 'companyFingerprint' => str_repeat('b', 64),
                 'companyIdentityVerified' => true,
@@ -608,6 +689,7 @@ try {
                     'name' => 'North',
                     'fullName' => 'Warehouse:North',
                     'active' => true,
+                    'found' => true,
                 ]],
                 'companyFingerprint' => str_repeat('b', 64),
                 'companyIdentityVerified' => true,
@@ -662,6 +744,70 @@ try {
         && $unitDiagnosticRequest['listIds'] === ['ITEM-LIST-1'],
         'item U/M diagnostics are ListID-bound and return the company unit set');
 
+    $scanRequest = null;
+    $scanClient = new QuickBooksBridgeClient(
+        'http://127.0.0.1:8765',
+        $secret,
+        static function (string $url, string $body) use ($secret, &$scanRequest): array {
+            $scanRequest = json_decode($body, true, 16, JSON_THROW_ON_ERROR);
+            $preferences = [
+                'customerTaxCodeEnabled' => null,
+                'vendorTaxCodeEnabled' => null,
+                'amountsIncludeTax' => null,
+                'defaultTaxableCode' => ['listId' => null, 'fullName' => null],
+                'defaultNonTaxableCode' => ['listId' => null, 'fullName' => null],
+                'defaultTaxItem' => ['listId' => null, 'fullName' => null],
+                'multiLocationAvailable' => null,
+                'multiLocationEnabled' => null,
+                'lotTracking' => null,
+                'expirationDateEnabled' => null,
+                'salesTransactionTrackingEnabled' => null,
+            ];
+            $category = static fn(string $name, string $scope, int $limit, array $records = []): array => [
+                'category' => $name,
+                'scope' => $scope,
+                'status' => 'complete',
+                'diagnosticCode' => null,
+                'recordCount' => count($records),
+                'limit' => $limit,
+                'records' => $records,
+            ];
+            $categories = [
+                $category('customers', 'customer', 100),
+                $category('items', 'item', 100),
+                $category('inventory_sites', 'local_exact_names', 20),
+                $category('mapped_item_units', 'saved_item_list_ids', 20),
+                $category('saved_tax_codes', 'saved_tax_code_list_ids', 20),
+                $category('company_preferences', 'company_preferences', 1, [$preferences]),
+            ];
+            $responseBody = json_encode([
+                'requestId' => $scanRequest['requestId'],
+                'status' => 'ok',
+                'entity' => 'reference_scan',
+                'records' => $categories,
+                'companyFingerprint' => str_repeat('b', 64),
+                'companyIdentityVerified' => true,
+                'qbxmlVersion' => '16.0',
+            ], JSON_THROW_ON_ERROR);
+            return test_signed_response(200, $responseBody, $scanRequest['requestId'], $secret);
+        }
+    );
+    $scanResult = $scanClient->scanReferences(['Warehouse:North'], ['ITEM-LIST-1'], ['TAX-LIST-1']);
+    test_assert($scanResult['available']
+        && count($scanResult['response']['records']) === 6
+        && $scanRequest['entity'] === 'reference_scan'
+        && $scanRequest['siteNames'] === ['Warehouse:North']
+        && $scanRequest['itemListIds'] === ['ITEM-LIST-1']
+        && $scanRequest['taxCodeListIds'] === ['TAX-LIST-1'],
+        'reference scan signs the bounded supported-category scopes and validates the company-bound report');
+    $scanLimitRejected = false;
+    try {
+        $scanClient->scanReferences(array_fill(0, 21, 'Warehouse'), [], []);
+    } catch (InvalidArgumentException) {
+        $scanLimitRejected = true;
+    }
+    test_assert($scanLimitRejected, 'PHP reference scan rejects oversized exact-query scopes before transport');
+
     $preferencesDiagnosticClient = new QuickBooksBridgeClient(
         'http://127.0.0.1:8765',
         $secret,
@@ -696,6 +842,50 @@ try {
         && $preferencesDiagnostic['response']['records'][0]['lotTracking'] === 'LotNumber'
         && $preferencesDiagnostic['response']['companyIdentity']['legalCompanyName'] === 'Verified Test Company LLC',
         'company preferences diagnostics require and expose a verified company identity');
+
+    $diagnosticFailureClient = new QuickBooksBridgeClient(
+        'http://127.0.0.1:8765',
+        $secret,
+        static function (string $url, string $body) use ($secret): array {
+            $request = json_decode($body, true, 16, JSON_THROW_ON_ERROR);
+            $responseBody = json_encode([
+                'requestId' => $request['requestId'],
+                'status' => 'unavailable',
+                'diagnosticCode' => 'COMPANY_SESSION_UNAVAILABLE',
+                'failureStage' => 'begin_session',
+                'sdkErrorCode' => 'SDK_COM_80040418',
+            ], JSON_THROW_ON_ERROR);
+            return test_signed_response(503, $responseBody, $request['requestId'], $secret);
+        }
+    );
+    $diagnosticFailure = $diagnosticFailureClient->diagnoseCompanyConfiguration('company_preferences');
+    test_assert(
+        !$diagnosticFailure['available']
+            && $diagnosticFailure['diagnostic_code'] === 'COMPANY_SESSION_UNAVAILABLE'
+            && $diagnosticFailure['failure_stage'] === 'begin_session'
+            && $diagnosticFailure['sdk_error_code'] === 'SDK_COM_80040418',
+        'signed diagnostic failures preserve only allowlisted SDK stage and HRESULT details'
+    );
+
+    $unsafeDiagnosticFailureClient = new QuickBooksBridgeClient(
+        'http://127.0.0.1:8765',
+        $secret,
+        static function (string $url, string $body) use ($secret): array {
+            $request = json_decode($body, true, 16, JSON_THROW_ON_ERROR);
+            $responseBody = json_encode([
+                'requestId' => $request['requestId'],
+                'status' => 'unavailable',
+                'diagnosticCode' => 'COMPANY_SESSION_UNAVAILABLE',
+                'failureStage' => 'Sensitive company path',
+            ], JSON_THROW_ON_ERROR);
+            return test_signed_response(503, $responseBody, $request['requestId'], $secret);
+        }
+    );
+    test_assert(
+        $unsafeDiagnosticFailureClient->diagnoseCompanyConfiguration('company_preferences')['diagnostic_code']
+            === 'BRIDGE_RESPONSE_MISMATCH',
+        'signed diagnostic failures reject unrecognized stage values'
+    );
 
     $missingCompanyIdentityClient = new QuickBooksBridgeClient(
         'http://127.0.0.1:8765',
@@ -781,6 +971,7 @@ try {
                     'manufacturerPartNumber' => null,
                     'salesDescription' => 'Example Product',
                     'active' => true,
+                    'found' => true,
                 ]],
                 'companyFingerprint' => str_repeat('b', 64),
                 'companyIdentityVerified' => true,
@@ -864,8 +1055,8 @@ try {
                 'entity' => 'customer',
                 'searchName' => $request['searchName'],
                 'records' => [
-                    ['listId' => 'CUST-1', 'name' => $request['searchName'], 'fullName' => 'Customer:1', 'companyName' => null, 'active' => true],
-                    ['listId' => 'CUST-2', 'name' => $request['searchName'], 'fullName' => 'Customer:2', 'companyName' => null, 'active' => true],
+                    ['listId' => 'CUST-1', 'name' => $request['searchName'], 'fullName' => 'Customer:1', 'companyName' => null, 'active' => true, 'found' => true],
+                    ['listId' => 'CUST-2', 'name' => $request['searchName'], 'fullName' => 'Customer:2', 'companyName' => null, 'active' => true, 'found' => true],
                 ],
                 'companyFingerprint' => str_repeat('b', 64),
                 'companyIdentityVerified' => true,
@@ -891,6 +1082,7 @@ try {
                     'fullName' => $request['searchName'],
                     'salesDescription' => $request['searchName'],
                     'active' => true,
+                    'found' => true,
                 ]],
                 'companyFingerprint' => str_repeat('b', 64),
                 'companyIdentityVerified' => true,
@@ -1197,6 +1389,7 @@ try {
         'requestId' => qb_export_uuid(),
         'operation' => 'submit',
         'transactionType' => 'invoice',
+        'preparationMode' => 'legacy_mapped',
         'idempotencyKey' => str_repeat('a', 64),
         'source' => ['id' => 1, 'revision' => str_repeat('a', 64)],
         'transaction' => [
@@ -1211,6 +1404,7 @@ try {
                 'quantity' => '2',
                 'rate' => '10.00',
                 'expectedAmount' => '20.00',
+                'pricingSource' => 'mfc_entered',
                 'salesTaxCode' => ['listId' => 'TAX-LIST-1'],
                 'site' => 'Main Site',
                 'lotNumber' => null,
@@ -1354,9 +1548,11 @@ try {
     $unapprovedPreview = qb_export_validate($pdo, 'invoice', 1);
     test_assert($unapprovedCustomer === null && $unapprovedItem === null,
         'name candidates without stored Admin-approved signed evidence cannot resolve customer or item references');
-    test_assert(test_has_error($unapprovedPreview, 'CUSTOMER_MAPPING_UNVERIFIED')
-        && test_has_error($unapprovedPreview, 'ITEM_MAPPING_UNVERIFIED'),
-        'invoice validation remains blocked until current signed customer and item evidence is stored');
+    test_assert(!test_has_error($unapprovedPreview, 'CUSTOMER_MAPPING_UNVERIFIED')
+        && !test_has_error($unapprovedPreview, 'ITEM_MAPPING_UNVERIFIED')
+        && $unapprovedPreview['transaction']['customer_full_name'] === 'Example Customer'
+        && $unapprovedPreview['transaction']['lines'][0]['item_full_name'] === 'ITEM-CODE-1',
+        'unsigned local name and code values remain explicit FullName candidates, not signed mapping evidence');
 
     echo "All QuickBooks export foundation checks passed.\n";
 } catch (Throwable $error) {

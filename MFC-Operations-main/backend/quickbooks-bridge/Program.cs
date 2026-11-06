@@ -46,6 +46,23 @@ internal static class Program
             return 0;
         }
 
+        var listenerPrefix = Prefix;
+        var testListener = false;
+        var testPort = 0;
+        if (args.Length == 2 && args[0] == "--test-listen-port")
+        {
+            if (!Int32.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out testPort)
+                || testPort < 1024
+                || testPort > 65535
+                || testPort == 8765)
+            {
+                Console.Error.WriteLine("Bridge test listener requires an available non-default loopback port.");
+                return 2;
+            }
+            listenerPrefix = "http://127.0.0.1:" + testPort.ToString(CultureInfo.InvariantCulture) + "/";
+            testListener = true;
+        }
+
         var secret = Environment.GetEnvironmentVariable("WQ_QB_BRIDGE_SECRET");
         if (String.IsNullOrEmpty(secret) || Encoding.UTF8.GetByteCount(secret) < 32)
         {
@@ -60,8 +77,11 @@ internal static class Program
             return String.Equals(StringValue(result, "status"), "candidate", StringComparison.Ordinal) ? 0 : 1;
         }
 
+        var singletonName = testListener
+            ? @"Local\MFCOperationsQuickBooksReadOnlyBridgeTest_" + testPort.ToString(CultureInfo.InvariantCulture)
+            : @"Local\MFCOperationsQuickBooksReadOnlyBridge";
         bool createdNew;
-        using (var singleton = new Mutex(false, @"Local\MFCOperationsQuickBooksReadOnlyBridge", out createdNew))
+        using (var singleton = new Mutex(false, singletonName, out createdNew))
         {
             if (!singleton.WaitOne(0))
             {
@@ -79,7 +99,7 @@ internal static class Program
                 var replayCache = new ReplayCache(cachePath);
                 using (var listener = new HttpListener())
                 {
-                    listener.Prefixes.Add(Prefix);
+                    listener.Prefixes.Add(listenerPrefix);
                     try
                     {
                         listener.Start();
@@ -87,12 +107,12 @@ internal static class Program
                     catch (HttpListenerException error)
                     {
                         Console.Error.WriteLine(
-                            "Bridge listener could not bind to 127.0.0.1:8765 (Windows error "
+                            "Bridge listener could not bind to " + listenerPrefix.TrimEnd('/') + " (Windows error "
                             + error.ErrorCode.ToString(CultureInfo.InvariantCulture)
                             + "). Check for a port conflict or URL ACL; no process was stopped.");
                         return 2;
                     }
-                    Console.WriteLine("QuickBooks bridge listening on 127.0.0.1:8765.");
+                    Console.WriteLine("QuickBooks bridge listening on " + listenerPrefix.TrimEnd('/') + ".");
                     Console.WriteLine("Listener ready; QuickBooks company access has not been verified.");
                     Console.WriteLine("InvoiceAdd remains disabled unless explicitly enabled in the bridge environment.");
                     while (true)
@@ -109,6 +129,7 @@ internal static class Program
                         HandleRequest(context, secret, replayCache);
                     }
                 }
+
             }
             catch (Exception)
             {
@@ -251,7 +272,8 @@ internal static class Program
                 WriteResponse(context.Response, 400, requestId, "error", "DIAGNOSTIC_REQUEST_REJECTED", secret, null);
                 return;
             }
-            var diagnostic = RunDiagnosticIsolated(entity, listIds, searchName);
+            var scanOptions = entity == "reference_scan" ? ReadReferenceScanOptions(request) : null;
+            var diagnostic = RunDiagnosticIsolated(entity, listIds, searchName, scanOptions);
             WriteResponse(
                 context.Response,
                 diagnostic.StatusCode,
@@ -479,85 +501,175 @@ internal static class Program
     {
         var transaction = ObjectValue(request, "transaction");
         var customer = ObjectValue(transaction, "customer");
-        var customerId = StringValue(customer, "listId");
-        List<Dictionary<string, object>> customerRecords =
-            QueryRecords(processor, ticket, "customer", new List<string> { customerId }, version);
-        var customerRecord = customerRecords.Single();
-        if (!IsActiveRecord(customerRecord))
+        string customerError;
+        var customerRecord = ResolveInvoiceReference(processor, ticket, version, "customer", customer, out customerError);
+        if (customerRecord == null)
         {
-            return Tuple.Create("CUSTOMER_REFERENCE_INVALID", "The mapped QuickBooks customer is missing or inactive.");
+            return Tuple.Create(customerError, customerError == "CUSTOMER_FULLNAME_AMBIGUOUS"
+                ? "The customer FullName matches more than one QuickBooks record."
+                : customerError == "CUSTOMER_FULLNAME_NOT_FOUND"
+                    ? "No QuickBooks customer has the exact requested FullName."
+                    : customerError == "CUSTOMER_FULLNAME_INACTIVE"
+                        ? "The exact QuickBooks customer FullName is inactive."
+                    : customerError == "CUSTOMER_FULLNAME_ACTIVE_STATUS_UNKNOWN"
+                        ? "QuickBooks did not verify the active status of the exact customer FullName."
+                    : "The customer reference does not resolve to exactly one active QuickBooks record.");
         }
 
         var lines = ArrayValue(transaction, "lines");
-        var itemIds = lines.Select(line => StringValue(ObjectValue((Dictionary<string, object>)line, "item"), "listId"))
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-        foreach (var itemId in itemIds)
+        var itemRecords = new Dictionary<string, Dictionary<string, object>>(StringComparer.Ordinal);
+        var itemListIds = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var value in lines)
         {
-            List<Dictionary<string, object>> itemRecords =
-                QueryRecords(processor, ticket, "item", new List<string> { itemId }, version);
-            var item = itemRecords.Single();
-            if (!IsActiveRecord(item))
+            var line = (Dictionary<string, object>)value;
+            var itemReference = ObjectValue(line, "item");
+            var itemKey = InvoiceReferenceKey(itemReference);
+            if (itemRecords.ContainsKey(itemKey))
             {
-                return Tuple.Create("ITEM_REFERENCE_INVALID", "A mapped QuickBooks item is missing or inactive.");
+                continue;
             }
+            string itemError;
+            var itemRecord = ResolveInvoiceReference(processor, ticket, version, "item", itemReference, out itemError);
+            if (itemRecord == null)
+            {
+                return Tuple.Create(itemError, itemError == "ITEM_FULLNAME_AMBIGUOUS"
+                    ? "An item FullName matches more than one QuickBooks record."
+                    : itemError == "ITEM_FULLNAME_NOT_FOUND"
+                        ? "No QuickBooks item has the exact requested FullName."
+                        : itemError == "ITEM_FULLNAME_INACTIVE"
+                            ? "The exact QuickBooks item FullName is inactive."
+                        : itemError == "ITEM_FULLNAME_ACTIVE_STATUS_UNKNOWN"
+                            ? "QuickBooks did not verify the active status of the exact item FullName."
+                        : "An item reference does not resolve to exactly one active QuickBooks record.");
+            }
+            itemRecords.Add(itemKey, itemRecord);
+            itemListIds.Add(itemKey, StringValue(itemRecord, "listId"));
         }
 
-        var taxIds = lines.Select(line => StringValue(ObjectValue((Dictionary<string, object>)line, "salesTaxCode"), "listId"))
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-        foreach (var taxId in taxIds)
-        {
-            List<Dictionary<string, object>> taxRecords =
-                QueryRecords(processor, ticket, "tax_code", new List<string> { taxId }, version);
-            var tax = taxRecords.Single();
-            if (!IsActiveRecord(tax))
-            {
-                return Tuple.Create("TAX_CODE_INVALID", "A mapped QuickBooks sales-tax code is missing or inactive.");
-            }
-        }
-
+        var managedDefaults = String.Equals(
+            StringValue(request, "preparationMode"),
+            "quickbooks_managed_defaults",
+            StringComparison.Ordinal);
         List<Dictionary<string, object>> preferenceRecords =
             QueryCompanyPreferences(processor, ticket, version);
         var preferences = preferenceRecords.Single();
-        if (!BooleanValue(preferences, "customerTaxCodeEnabled"))
+        object multiLocationAvailable;
+        object multiLocationEnabled;
+        preferences.TryGetValue("multiLocationAvailable", out multiLocationAvailable);
+        preferences.TryGetValue("multiLocationEnabled", out multiLocationEnabled);
+        if (!(multiLocationAvailable is bool) || !(multiLocationEnabled is bool))
         {
-            return Tuple.Create("CUSTOMER_TAX_CODES_DISABLED", "The active QuickBooks company does not have customer sales-tax codes enabled.");
+            return Tuple.Create(
+                "INVENTORY_SITE_PREFERENCE_UNKNOWN",
+                "QuickBooks inventory-site availability or enabled status is unknown; no invoice was sent.");
         }
-        if (!BooleanValue(preferences, "multiLocationAvailable")
-            || !BooleanValue(preferences, "multiLocationEnabled"))
+        if (!(bool)multiLocationAvailable || !(bool)multiLocationEnabled)
         {
             return Tuple.Create("INVENTORY_SITES_DISABLED", "The active QuickBooks company does not have inventory-site tracking enabled.");
+        }
+        if (managedDefaults)
+        {
+            foreach (var field in new[] { "defaultTaxableCode", "defaultNonTaxableCode" })
+            {
+                var taxReference = ObjectValue(preferences, field);
+                var taxListId = taxReference == null ? null : StringValue(taxReference, "listId");
+                if (!IsValidListId(taxListId))
+                {
+                    return Tuple.Create(
+                        "TAX_DEFAULTS_UNVERIFIED",
+                        "QuickBooks company tax defaults are missing or could not be verified; no invoice was sent.");
+                }
+                var taxRecords = QueryRecords(processor, ticket, "tax_code", new List<string> { taxListId }, version);
+                if (taxRecords.Count != 1 || !IsActiveRecord(taxRecords[0]))
+                {
+                    return Tuple.Create(
+                        "TAX_DEFAULTS_UNVERIFIED",
+                        "A QuickBooks company tax default is missing or inactive; no invoice was sent.");
+                }
+            }
+        }
+        else
+        {
+            var taxIds = lines.Select(line => StringValue(
+                    ObjectValue((Dictionary<string, object>)line, "salesTaxCode"),
+                    "listId"))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            foreach (var taxId in taxIds)
+            {
+                List<Dictionary<string, object>> taxRecords =
+                    QueryRecords(processor, ticket, "tax_code", new List<string> { taxId }, version);
+                var tax = taxRecords.Single();
+                if (!IsActiveRecord(tax))
+                {
+                    return Tuple.Create("TAX_CODE_INVALID", "A mapped QuickBooks sales-tax code is missing or inactive.");
+                }
+            }
         }
 
         foreach (var value in lines)
         {
             var line = (Dictionary<string, object>)value;
             var siteName = StringValue(line, "site");
-            var sites = QueryRecordsByName(processor, ticket, "inventory_site", siteName, version);
-            if (sites.Count != 1
-                || !IsActiveRecord(sites[0])
-                || !String.Equals(StringValue(sites[0], "fullName"), siteName, StringComparison.Ordinal))
+            List<Dictionary<string, object>> sites;
+            try
             {
-                return Tuple.Create("SITE_REFERENCE_INVALID", "Each invoice line must resolve to exactly one active QuickBooks site with the exact configured FullName.");
+                sites = QueryRecordsByName(processor, ticket, "inventory_site", siteName, version);
+            }
+            catch (Exception)
+            {
+                return Tuple.Create("SITE_QUERY_FAILED", "The read-only QuickBooks inventory-site query failed; the saved Site was not verified.");
+            }
+            if (sites.Count == 0)
+            {
+                return Tuple.Create("SITE_NOT_FOUND", "No QuickBooks inventory Site has the saved FullName.");
+            }
+            if (sites.Count > 1)
+            {
+                return Tuple.Create("SITE_FULLNAME_AMBIGUOUS", "More than one QuickBooks inventory Site matched the saved FullName.");
+            }
+            if (!String.Equals(StringValue(sites[0], "fullName"), siteName, StringComparison.Ordinal))
+            {
+                return Tuple.Create("SITE_FULLNAME_MISMATCH", "The returned QuickBooks inventory Site FullName does not exactly match the saved Site.");
+            }
+            object activeSite;
+            if (!sites[0].TryGetValue("active", out activeSite) || !(activeSite is bool))
+            {
+                return Tuple.Create("SITE_ACTIVE_STATUS_UNKNOWN", "QuickBooks did not verify that the exact inventory Site is active.");
+            }
+            if (!(bool)activeSite)
+            {
+                return Tuple.Create("SITE_INACTIVE", "The exact QuickBooks inventory Site is inactive.");
             }
 
             var unitName = StringValue(line, "unitOfMeasure");
-            if (!String.IsNullOrWhiteSpace(unitName))
+            var itemId = itemListIds[InvoiceReferenceKey(ObjectValue(line, "item"))];
+            List<Dictionary<string, object>> unitRecords =
+                QueryItemUnits(processor, ticket, new List<string> { itemId }, version);
+            var units = unitRecords.Single();
+            var unitSetId = StringValue(units, "unitSetListId");
+            if (String.IsNullOrWhiteSpace(unitSetId))
             {
-                var itemId = StringValue(ObjectValue(line, "item"), "listId");
-                List<Dictionary<string, object>> unitRecords =
-                    QueryItemUnits(processor, ticket, new List<string> { itemId }, version);
-                var units = unitRecords.Single();
-                var unitNames = ((List<object>)units["units"]).OfType<Dictionary<string, object>>()
-                    .Select(unit => StringValue(unit, "name"));
-                if (!IsActiveRecord(units)
-                    || !Equals(units["unitSetActive"], true)
-                    || !String.Equals(StringValue(units, "salesDefaultUnit"), unitName, StringComparison.Ordinal)
-                    || !unitNames.Contains(unitName, StringComparer.Ordinal))
+                if (!IsActiveRecord(units) || !String.IsNullOrWhiteSpace(unitName))
                 {
-                    return Tuple.Create("UNIT_OF_MEASURE_INVALID", "The supplied unit does not match the active item's QuickBooks sales default unit.");
+                    return Tuple.Create("UNIT_OF_MEASURE_INVALID", "The QuickBooks item unit configuration could not be verified.");
                 }
+                continue;
+            }
+            var unitNames = ((List<object>)units["units"]).OfType<Dictionary<string, object>>()
+                .Select(unit => StringValue(unit, "name"));
+            if (!IsActiveRecord(units)
+                || !Equals(units["unitSetActive"], true)
+                || String.IsNullOrWhiteSpace(StringValue(units, "salesDefaultUnit"))
+                || String.IsNullOrWhiteSpace(unitName)
+                || !String.Equals(StringValue(units, "salesDefaultUnit"), unitName, StringComparison.Ordinal)
+                || !unitNames.Contains(unitName, StringComparer.Ordinal))
+            {
+                return Tuple.Create(
+                    String.IsNullOrWhiteSpace(unitName) ? "UNIT_OF_MEASURE_REQUIRED" : "UNIT_OF_MEASURE_INVALID",
+                    String.IsNullOrWhiteSpace(unitName)
+                        ? "The QuickBooks item uses a unit set; provide its verified sales unit to preserve quantity meaning."
+                        : "The supplied unit does not match the active item's QuickBooks sales default unit.");
             }
         }
 
@@ -566,7 +678,76 @@ internal static class Program
         {
             return Tuple.Create("LOT_TRACKING_UNAVAILABLE", "The active QuickBooks company is not configured for lot-number tracking.");
         }
+        SetInvoiceReferenceListId(customer, StringValue(customerRecord, "listId"));
+        foreach (var value in lines)
+        {
+            var line = (Dictionary<string, object>)value;
+            var itemReference = ObjectValue(line, "item");
+            SetInvoiceReferenceListId(itemReference, itemListIds[InvoiceReferenceKey(itemReference)]);
+        }
         return null;
+    }
+
+    private static Dictionary<string, object> ResolveInvoiceReference(
+        dynamic processor,
+        string ticket,
+        string version,
+        string entity,
+        Dictionary<string, object> reference,
+        out string errorCode)
+    {
+        errorCode = entity == "customer" ? "CUSTOMER_REFERENCE_INVALID" : "ITEM_REFERENCE_INVALID";
+        Dictionary<string, object> record;
+        if (reference.ContainsKey("listId"))
+        {
+            var listId = StringValue(reference, "listId");
+            List<Dictionary<string, object>> records =
+                QueryRecords(processor, ticket, entity, new List<string> { listId }, version);
+            record = records.Single();
+            return IsActiveRecord(record) ? record : null;
+        }
+
+        var fullName = StringValue(reference, "fullName");
+        List<Dictionary<string, object>> candidates =
+            QueryRecordsByName(processor, ticket, entity, fullName, version, true);
+        var matches = candidates
+            .Where(candidate => String.Equals(StringValue(candidate, "fullName"), fullName, StringComparison.Ordinal))
+            .ToList();
+        if (matches.Count != 1)
+        {
+            errorCode = entity.ToUpperInvariant() + "_FULLNAME_" + (matches.Count > 1 ? "AMBIGUOUS" : "NOT_FOUND");
+            return null;
+        }
+        record = matches[0];
+        if (!IsActiveRecord(record))
+        {
+            object active;
+            record.TryGetValue("active", out active);
+            errorCode = entity.ToUpperInvariant()
+                + (active is bool && !(bool)active ? "_FULLNAME_INACTIVE" : "_FULLNAME_ACTIVE_STATUS_UNKNOWN");
+            return null;
+        }
+        errorCode = entity == "customer" ? "CUSTOMER_REFERENCE_INVALID" : "ITEM_REFERENCE_INVALID";
+        return record;
+    }
+
+    private static string InvoiceReferenceKey(Dictionary<string, object> reference)
+    {
+        return reference.ContainsKey("listId")
+            ? "listId:" + StringValue(reference, "listId")
+            : "fullName:" + StringValue(reference, "fullName");
+    }
+
+    private static void SetInvoiceReferenceListId(Dictionary<string, object> reference, string listId)
+    {
+        reference.Clear();
+        reference.Add("listId", listId);
+    }
+
+    private static void SetInvoiceReferenceFullName(Dictionary<string, object> reference, string fullName)
+    {
+        reference.Clear();
+        reference.Add("fullName", fullName);
     }
 
     private static bool IsActiveRecord(Dictionary<string, object> record)
@@ -579,11 +760,12 @@ internal static class Program
 
     private static bool ValidateSubmitRequest(Dictionary<string, object> request)
     {
-        if (!OnlyKeys(request, "protocolVersion", "requestId", "operation", "transactionType", "idempotencyKey", "source", "transaction")
-            || !HasKeys(request, "protocolVersion", "requestId", "operation", "transactionType", "idempotencyKey", "source", "transaction")
+        if (!OnlyKeys(request, "protocolVersion", "requestId", "operation", "transactionType", "preparationMode", "idempotencyKey", "source", "transaction")
+            || !HasKeys(request, "protocolVersion", "requestId", "operation", "transactionType", "preparationMode", "idempotencyKey", "source", "transaction")
             || !String.Equals(StringValue(request, "protocolVersion"), "1", StringComparison.Ordinal)
             || !String.Equals(StringValue(request, "operation"), "submit", StringComparison.Ordinal)
             || !String.Equals(StringValue(request, "transactionType"), "invoice", StringComparison.Ordinal)
+            || !new[] { "quickbooks_managed_defaults", "legacy_mapped" }.Contains(StringValue(request, "preparationMode"), StringComparer.Ordinal)
             || !IsGuid(StringValue(request, "requestId"))
             || !Regex.IsMatch(StringValue(request, "idempotencyKey") ?? "", "^[a-f0-9]{64}$"))
         {
@@ -620,31 +802,41 @@ internal static class Program
 
         var customer = ObjectValue(transaction, "customer");
         var lines = ArrayValue(transaction, "lines");
-        if (customer == null || !OnlyKeys(customer, "listId") || !HasKeys(customer, "listId")
-            || !IsValidListId(StringValue(customer, "listId"))
+        if (customer == null || !IsValidInvoiceReference(customer, "customer")
             || lines == null || lines.Count < 1 || lines.Count > 500)
         {
             return false;
         }
 
         decimal subtotal = 0m;
+        var managedDefaults = String.Equals(
+            StringValue(request, "preparationMode"),
+            "quickbooks_managed_defaults",
+            StringComparison.Ordinal);
         foreach (var value in lines)
         {
             var line = value as Dictionary<string, object>;
             var item = line == null ? null : ObjectValue(line, "item");
             var taxCode = line == null ? null : ObjectValue(line, "salesTaxCode");
+            var requiredLineKeys = managedDefaults
+                ? new[] { "item", "description", "quantity", "rate", "expectedAmount", "pricingSource", "site" }
+                : new[] { "item", "description", "quantity", "rate", "expectedAmount", "pricingSource", "salesTaxCode", "site" };
             if (line == null
                 || !OnlyKeys(line, "item", "description", "quantity", "rate", "expectedAmount", "salesTaxCode",
-                    "site", "lotNumber", "expirationDate", "unitOfMeasure")
-                || !HasKeys(line, "item", "description", "quantity", "rate", "expectedAmount", "salesTaxCode")
-                || item == null || !OnlyKeys(item, "listId") || !HasKeys(item, "listId")
-                || !IsValidListId(StringValue(item, "listId"))
+                    "pricingSource", "site", "lotNumber", "expirationDate", "unitOfMeasure")
+                || !HasKeys(line, requiredLineKeys)
+                || !new[] { "mfc_entered", "explicit_zero" }
+                    .Contains(StringValue(line, "pricingSource"), StringComparer.Ordinal)
+                || item == null || !IsValidInvoiceReference(item, "item")
                 || !IsBoundedString(StringValue(line, "description"), 4095, false)
                 || !IsPositiveQuantity(StringValue(line, "quantity"))
                 || !IsMoneyString(StringValue(line, "rate"))
                 || !IsMoneyString(StringValue(line, "expectedAmount"))
-                || taxCode == null || !OnlyKeys(taxCode, "listId") || !HasKeys(taxCode, "listId")
-                || !IsValidListId(StringValue(taxCode, "listId"))
+                || (managedDefaults && line.ContainsKey("salesTaxCode"))
+                || (!managedDefaults && (taxCode == null
+                    || !OnlyKeys(taxCode, "listId")
+                    || !HasKeys(taxCode, "listId")
+                    || !IsValidListId(StringValue(taxCode, "listId"))))
                 || !IsBoundedStringValue(line, "site", 31)
                 || String.IsNullOrWhiteSpace(StringValue(line, "site"))
                 || !IsBoundedStringValue(line, "lotNumber", 40)
@@ -659,6 +851,8 @@ internal static class Program
             if (!Decimal.TryParse(StringValue(line, "expectedAmount"), NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out amount)
                 || !Decimal.TryParse(StringValue(line, "rate"), NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out rate)
                 || !Decimal.TryParse(StringValue(line, "quantity"), NumberStyles.None, CultureInfo.InvariantCulture, out quantity)
+                || (String.Equals(StringValue(line, "pricingSource"), "explicit_zero", StringComparison.Ordinal)
+                    && rate != 0m)
                 || amount != Decimal.Round(rate * quantity, 2, MidpointRounding.AwayFromZero))
             {
                 return false;
@@ -677,6 +871,24 @@ internal static class Program
         return true;
     }
 
+    private static bool IsValidInvoiceReference(Dictionary<string, object> reference, string entity)
+    {
+        if (reference == null || reference.Count != 1)
+        {
+            return false;
+        }
+        if (reference.ContainsKey("listId"))
+        {
+            return IsValidListId(StringValue(reference, "listId"));
+        }
+        var maximumLength = entity == "customer" ? 209 : 159;
+        var fullName = StringValue(reference, "fullName");
+        return OnlyKeys(reference, "fullName")
+            && IsBoundedString(fullName, maximumLength, false)
+            && String.Equals(fullName, fullName.Trim(), StringComparison.Ordinal)
+            && !fullName.Any(Char.IsControl);
+    }
+
     private static string BuildInvoiceAddRequest(Dictionary<string, object> request, string qbxmlVersion)
     {
         if (!ValidateSubmitRequest(request) || !IsBoundedString(qbxmlVersion, 20, false))
@@ -687,6 +899,10 @@ internal static class Program
         var transaction = ObjectValue(request, "transaction");
         var customer = ObjectValue(transaction, "customer");
         var lines = ArrayValue(transaction, "lines");
+        var managedDefaults = String.Equals(
+            StringValue(request, "preparationMode"),
+            "quickbooks_managed_defaults",
+            StringComparison.Ordinal);
         var builder = new StringBuilder();
         var settings = new XmlWriterSettings { OmitXmlDeclaration = true, Encoding = new UTF8Encoding(false), Indent = false };
         builder.Append("<?xml version=\"1.0\" encoding=\"utf-8\"?><?qbxml version=\"")
@@ -709,7 +925,6 @@ internal static class Program
             {
                 var line = value as Dictionary<string, object>;
                 var item = ObjectValue(line, "item");
-                var taxCode = ObjectValue(line, "salesTaxCode");
                 writer.WriteStartElement("InvoiceLineAdd");
                 WriteListReference(writer, "ItemRef", StringValue(item, "listId"));
                 writer.WriteElementString("Desc", StringValue(line, "description"));
@@ -719,7 +934,11 @@ internal static class Program
                 writer.WriteElementString("Amount", StringValue(line, "expectedAmount"));
                 WriteListReference(writer, "InventorySiteRef", null, StringValue(line, "site"));
                 WriteOptionalElement(writer, "LotNumber", line, "lotNumber");
-                WriteListReference(writer, "SalesTaxCodeRef", StringValue(taxCode, "listId"));
+                if (!managedDefaults)
+                {
+                    var taxCode = ObjectValue(line, "salesTaxCode");
+                    WriteListReference(writer, "SalesTaxCodeRef", StringValue(taxCode, "listId"));
+                }
                 writer.WriteEndElement();
             }
             writer.WriteEndElement();
@@ -931,14 +1150,27 @@ internal static class Program
         entity = StringValue(request, "entity");
         listIds = null;
         searchName = StringValue(request, "searchName");
-        if (!OnlyKeys(request, "operation", "requestId", "entity", "listIds", "searchName")
+        if (!OnlyKeys(request, "operation", "requestId", "entity", "listIds", "searchName",
+                "siteNames", "itemListIds", "taxCodeListIds")
             || !String.Equals(StringValue(request, "operation"), "diagnose", StringComparison.Ordinal)
             || !new[]
             {
                 "customer", "item", "tax_code", "tax_item", "inventory_site",
-                "item_uom", "invoice_custom_fields", "company_preferences"
+                "item_uom", "invoice_custom_fields", "company_preferences", "reference_scan"
             }.Contains(entity, StringComparer.Ordinal)
             || (request.ContainsKey("searchName") && request.ContainsKey("listIds")))
+        {
+            return false;
+        }
+        if (entity == "reference_scan")
+        {
+            return !request.ContainsKey("listIds")
+                && !request.ContainsKey("searchName")
+                && IsValidScanValues(ArrayValue(request, "siteNames"), 20, 255, false)
+                && IsValidScanValues(ArrayValue(request, "itemListIds"), 20, 100, true)
+                && IsValidScanValues(ArrayValue(request, "taxCodeListIds"), 20, 100, true);
+        }
+        if (request.ContainsKey("siteNames") || request.ContainsKey("itemListIds") || request.ContainsKey("taxCodeListIds"))
         {
             return false;
         }
@@ -976,29 +1208,68 @@ internal static class Program
         return true;
     }
 
-    private static DiagnosticResult RunDiagnostic(string entity, List<string> listIds, string searchName, string secret)
+    private static bool IsValidScanValues(List<object> values, int maximumCount, int maximumLength, bool listIds)
     {
-        using (var sdkMutex = new Mutex(false, SdkSessionMutexName))
+        if (values == null || values.Count > maximumCount) return false;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var value in values)
         {
-            bool acquired;
-            try { acquired = sdkMutex.WaitOne(0); }
-            catch (AbandonedMutexException) { acquired = true; }
-            if (!acquired)
+            var text = value as string;
+            if (!IsBoundedString(text, maximumLength, false)
+                || !String.Equals(text, text.Trim(), StringComparison.Ordinal)
+                || text.Any(Char.IsControl)
+                || (listIds && !IsValidListId(text))
+                || !seen.Add(text))
             {
-                return DiagnosticResult.Unavailable("QUICKBOOKS_SESSION_BUSY");
+                return false;
             }
-            try
+        }
+        return true;
+    }
+
+    private static Dictionary<string, object> ReadReferenceScanOptions(Dictionary<string, object> request)
+    {
+        return new Dictionary<string, object>
+        {
+            { "siteNames", ArrayValue(request, "siteNames") ?? new List<object>() },
+            { "itemListIds", ArrayValue(request, "itemListIds") ?? new List<object>() },
+            { "taxCodeListIds", ArrayValue(request, "taxCodeListIds") ?? new List<object>() }
+        };
+    }
+
+    private static DiagnosticResult RunDiagnostic(string entity, List<string> listIds, string searchName, Dictionary<string, object> scanOptions, string secret)
+    {
+        try
+        {
+            using (var sdkMutex = new Mutex(false, SdkSessionMutexName))
             {
-                return RunDiagnosticSession(entity, listIds, searchName, secret);
+                bool acquired;
+                try { acquired = sdkMutex.WaitOne(0); }
+                catch (AbandonedMutexException) { acquired = true; }
+                if (!acquired)
+                {
+                    return DiagnosticResult.Unavailable("QUICKBOOKS_SESSION_BUSY", "sdk_session_mutex");
+                }
+                try
+                {
+                    return RunDiagnosticSession(entity, listIds, searchName, scanOptions, secret);
+                }
+                finally
+                {
+                    sdkMutex.ReleaseMutex();
+                }
             }
-            finally
-            {
-                sdkMutex.ReleaseMutex();
-            }
+        }
+        catch (Exception error)
+        {
+            return DiagnosticResult.Unavailable(
+                "SDK_SESSION_WORKER_FAILURE",
+                "sdk_session_mutex",
+                SanitizedComErrorCode(error));
         }
     }
 
-    private static DiagnosticResult RunDiagnosticSession(string entity, List<string> listIds, string searchName, string secret)
+    private static DiagnosticResult RunDiagnosticSession(string entity, List<string> listIds, string searchName, Dictionary<string, object> scanOptions, string secret)
     {
         object requestProcessor = null;
         dynamic processor = null;
@@ -1006,26 +1277,31 @@ internal static class Program
         bool connectionOpen = false;
         bool sessionOpen = false;
         var failureCode = "SDK_UNAVAILABLE";
+        var failureStage = "request_processor_activation";
         try
         {
             var processorType = Type.GetTypeFromProgID(RequestProcessorProgId, true);
             requestProcessor = Activator.CreateInstance(processorType);
             processor = requestProcessor;
             failureCode = "SDK_CONNECTION_FAILED";
+            failureStage = "open_connection";
             processor.OpenConnection("MFCOperationsReadOnlyBridge", "MFC Operations read-only diagnostics");
             connectionOpen = true;
             failureCode = "COMPANY_SESSION_UNAVAILABLE";
+            failureStage = "begin_session";
             ticket = (string)processor.BeginSession("", 2);
             sessionOpen = true;
 
             failureCode = "COMPANY_ID_UNAVAILABLE";
+            failureStage = "get_current_company_file";
             var companyPath = (string)processor.GetCurrentCompanyFileName(ticket);
             if (String.IsNullOrWhiteSpace(companyPath))
             {
-                return DiagnosticResult.Unavailable("COMPANY_SESSION_UNAVAILABLE");
+                return DiagnosticResult.Unavailable("COMPANY_SESSION_UNAVAILABLE", failureStage);
             }
 
             failureCode = "QBXML_VERSION_UNSUPPORTED";
+            failureStage = "qbxml_version_negotiation";
             var supported = processor.QBXMLVersionsForSession(ticket) as IEnumerable;
             var version = SelectQbXmlVersion(supported);
             if (version == null)
@@ -1034,6 +1310,7 @@ internal static class Program
             }
 
             failureCode = "COMPANY_IDENTITY_UNAVAILABLE";
+            failureStage = "company_identity_query";
             var companyIdentity = QueryCompanyIdentity(processor, ticket, version);
             var companyFingerprint = CompanyFingerprint(companyPath, companyIdentity, secret);
             var expectedFingerprint = Environment.GetEnvironmentVariable("WQ_QB_COMPANY_FINGERPRINT");
@@ -1048,8 +1325,23 @@ internal static class Program
             }
 
             failureCode = "QBXML_QUERY_FAILED";
+            failureStage = entity == "reference_scan"
+                ? "reference_scan_query"
+                : entity == "company_preferences"
+                ? "company_preferences_query"
+                : entity == "invoice_custom_fields"
+                    ? "invoice_custom_fields_query"
+                    : entity == "item_uom"
+                        ? "item_uom_query"
+                        : searchName != null
+                            ? "reference_name_query"
+                            : "reference_query";
             List<Dictionary<string, object>> records;
-            if (entity == "company_preferences")
+            if (entity == "reference_scan")
+            {
+                records = RunReferenceScan(processor, ticket, version, scanOptions);
+            }
+            else if (entity == "company_preferences")
             {
                 records = QueryCompanyPreferences(processor, ticket, version);
             }
@@ -1071,9 +1363,13 @@ internal static class Program
             }
             return DiagnosticResult.Ready(entity, records, companyFingerprint, companyIdentity, version, searchName);
         }
-        catch (Exception)
+        catch (Exception error)
         {
-            return DiagnosticResult.Unavailable(failureCode);
+            var queryStatusError = error as QuickBooksQueryStatusException;
+            return DiagnosticResult.Unavailable(
+                queryStatusError == null ? failureCode : queryStatusError.DiagnosticCode,
+                failureStage,
+                SanitizedComErrorCode(error));
         }
         finally
         {
@@ -1382,6 +1678,16 @@ internal static class Program
         }
     }
 
+    private sealed class QuickBooksQueryStatusException : Exception
+    {
+        public readonly string DiagnosticCode;
+
+        public QuickBooksQueryStatusException(int statusCode)
+        {
+            DiagnosticCode = "QBXML_QUERY_STATUS_" + statusCode.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
     private static string CompanyFingerprint(
         string companyPath,
         Dictionary<string, object> companyIdentity,
@@ -1413,7 +1719,11 @@ internal static class Program
             && ConstantTimeEquals(actualFingerprint, expectedFingerprint.ToLowerInvariant());
     }
 
-    private static DiagnosticResult RunDiagnosticIsolated(string entity, List<string> listIds, string searchName)
+    private static DiagnosticResult RunDiagnosticIsolated(
+        string entity,
+        List<string> listIds,
+        string searchName,
+        Dictionary<string, object> scanOptions)
     {
         var expectedFingerprint = Environment.GetEnvironmentVariable("WQ_QB_COMPANY_FINGERPRINT");
         var fingerprintConfigurationError = CompanyFingerprintConfigurationError(expectedFingerprint);
@@ -1444,41 +1754,62 @@ internal static class Program
             {
                 return DiagnosticResult.Unavailable("SDK_WORKER_UNAVAILABLE");
             }
-            worker.StandardInput.Write(Json.Serialize(new Dictionary<string, object>
+            var workerRequest = Encoding.UTF8.GetBytes(Json.Serialize(new Dictionary<string, object>
             {
                 { "entity", entity },
                 { "listIds", listIds ?? new List<string>() },
-                { "searchName", searchName }
+                { "searchName", searchName },
+                { "scanOptions", scanOptions }
             }));
+            worker.StandardInput.BaseStream.Write(workerRequest, 0, workerRequest.Length);
+            worker.StandardInput.BaseStream.Flush();
             worker.StandardInput.Close();
             var outputTask = worker.StandardOutput.ReadToEndAsync();
             var errorTask = worker.StandardError.ReadToEndAsync();
-            if (!WaitForWorker(worker, DiagnosticWorkerTimeoutMilliseconds))
+            var workerTimeout = entity == "reference_scan" ? 30000 : DiagnosticWorkerTimeoutMilliseconds;
+            if (!WaitForWorker(worker, workerTimeout))
             {
-                return DiagnosticResult.Unavailable("SDK_TIMEOUT");
+                return DiagnosticResult.Unavailable("SDK_TIMEOUT", "diagnostic_worker_timeout");
             }
             var output = outputTask.Result;
             var ignoredError = errorTask.Result;
             var result = StrictJsonParser.Parse(output) as Dictionary<string, object>;
             if (result == null)
             {
-                return DiagnosticResult.Unavailable("SDK_WORKER_INVALID_RESPONSE");
+                return DiagnosticResult.Unavailable("SDK_WORKER_INVALID_RESPONSE", "diagnostic_worker_response");
             }
             var statusCode = result.ContainsKey("httpStatus") && result["httpStatus"] is decimal
                 ? Decimal.ToInt32((decimal)result["httpStatus"])
                 : 503;
             var status = StringValue(result, "status");
+            var failureStage = StringValue(result, "failureStage");
+            var sdkErrorCode = StringValue(result, "sdkErrorCode");
+            var data = ObjectValue(result, "data");
+            if (data == null && (IsSafeFailureStage(failureStage) || IsSafeSdkErrorCode(sdkErrorCode)))
+            {
+                data = new Dictionary<string, object>();
+            }
+            if (data != null && IsSafeFailureStage(failureStage))
+            {
+                data["failureStage"] = failureStage;
+            }
+            if (data != null && IsSafeSdkErrorCode(sdkErrorCode))
+            {
+                data["sdkErrorCode"] = sdkErrorCode;
+            }
             return new DiagnosticResult
             {
                 StatusCode = statusCode,
                 Status = status == "ok" ? "ok" : "unavailable",
                 Code = StringValue(result, "diagnosticCode"),
-                Data = ObjectValue(result, "data")
+                Data = data,
+                FailureStage = IsSafeFailureStage(failureStage) ? failureStage : null,
+                SdkErrorCode = IsSafeSdkErrorCode(sdkErrorCode) ? sdkErrorCode : null
             };
         }
         catch (Exception)
         {
-            return DiagnosticResult.Unavailable("SDK_WORKER_UNAVAILABLE");
+            return DiagnosticResult.Unavailable("SDK_WORKER_UNAVAILABLE", "diagnostic_worker_launch");
         }
         finally
         {
@@ -1492,21 +1823,28 @@ internal static class Program
 
     private static int RunDiagnosticWorker()
     {
+        var failureStage = "worker_request_read";
+        string input = null;
         try
         {
-            var request = StrictJsonParser.Parse(Console.In.ReadToEnd()) as Dictionary<string, object>;
-            if (request == null || !OnlyKeys(request, "entity", "listIds", "searchName"))
+            using (var reader = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false, true), true))
+            {
+                input = reader.ReadToEnd();
+            }
+            failureStage = "worker_request_parse";
+            var request = StrictJsonParser.Parse(input) as Dictionary<string, object>;
+            failureStage = "worker_request_validation";
+            if (request == null || !OnlyKeys(request, "entity", "listIds", "searchName", "scanOptions"))
             {
                 throw new FormatException("Invalid worker request.");
             }
             var entity = StringValue(request, "entity");
             var values = ArrayValue(request, "listIds");
             var searchName = StringValue(request, "searchName");
-            if (String.IsNullOrEmpty(entity) || values == null
-                || (searchName == null && (values.Count < 1 || values.Count > MaxListIds))
-                || (searchName != null && (values.Count != 0
-                    || !IsBoundedString(searchName, 255, false)
-                    || !String.Equals(searchName, searchName.Trim(), StringComparison.Ordinal))))
+            var scanOptions = ObjectValue(request, "scanOptions");
+            if (!IsValidDiagnosticWorkerRequest(entity, values, searchName)
+                || (entity == "reference_scan" && !IsValidWorkerScanOptions(scanOptions))
+                || (entity != "reference_scan" && scanOptions != null))
             {
                 throw new FormatException("Invalid worker request.");
             }
@@ -1516,26 +1854,144 @@ internal static class Program
                 throw new FormatException("Invalid worker request.");
             }
             var secret = Environment.GetEnvironmentVariable("WQ_QB_BRIDGE_SECRET") ?? "";
-            var result = RunDiagnostic(entity, listIds, searchName, secret);
+            failureStage = "sdk_diagnostic";
+            var result = RunDiagnostic(entity, listIds, searchName, scanOptions, secret);
+            failureStage = "worker_response_serialization";
             Console.Out.Write(Json.Serialize(new Dictionary<string, object>
             {
                 { "httpStatus", result.StatusCode },
                 { "status", result.Status },
                 { "diagnosticCode", result.Code },
-                { "data", result.Data }
+                { "data", result.Data },
+                { "failureStage", result.FailureStage },
+                { "sdkErrorCode", result.SdkErrorCode }
             }));
             return result.Status == "ok" ? 0 : 1;
         }
-        catch (Exception)
+        catch (FormatException error)
+        {
+            var diagnosticCode = failureStage == "worker_request_parse"
+                ? SanitizedWorkerJsonFailureCode(error.Message, input)
+                : "SDK_WORKER_REQUEST_INVALID";
+            Console.Out.Write(Json.Serialize(new Dictionary<string, object>
+            {
+                { "httpStatus", 400 },
+                { "status", "error" },
+                { "diagnosticCode", diagnosticCode },
+                { "failureStage", failureStage },
+                { "sdkErrorCode", null }
+            }));
+            return 1;
+        }
+        catch (Exception error)
         {
             Console.Out.Write(Json.Serialize(new Dictionary<string, object>
             {
                 { "httpStatus", 503 },
                 { "status", "unavailable" },
-                { "diagnosticCode", "QB_SESSION_UNAVAILABLE" }
+                { "diagnosticCode", "SDK_WORKER_FAILURE" },
+                { "failureStage", failureStage },
+                { "sdkErrorCode", SanitizedComErrorCode(error) }
             }));
             return 1;
         }
+    }
+
+    private static bool IsValidDiagnosticWorkerRequest(string entity, List<object> values, string searchName)
+    {
+        if (!new[]
+            {
+                "customer", "item", "tax_code", "tax_item", "inventory_site",
+                "item_uom", "invoice_custom_fields", "company_preferences", "reference_scan"
+            }.Contains(entity, StringComparer.Ordinal)
+            || values == null)
+        {
+            return false;
+        }
+
+        var noListIdEntity = entity == "company_preferences" || entity == "invoice_custom_fields"
+            || entity == "reference_scan";
+        if (noListIdEntity)
+        {
+            return searchName == null && values.Count == 0;
+        }
+        if (searchName != null)
+        {
+            return (entity == "customer" || entity == "item" || entity == "inventory_site")
+                && values.Count == 0
+                && IsBoundedString(searchName, 255, false)
+                && String.Equals(searchName, searchName.Trim(), StringComparison.Ordinal)
+                && !searchName.Any(Char.IsControl);
+        }
+        return values.Count >= 1 && values.Count <= MaxListIds;
+    }
+
+    private static bool IsValidWorkerScanOptions(Dictionary<string, object> options)
+    {
+        if (options == null || !OnlyKeys(options, "siteNames", "itemListIds", "taxCodeListIds"))
+        {
+            return false;
+        }
+        return IsValidScanValues(ArrayValue(options, "siteNames"), 20, 255, false)
+            && IsValidScanValues(ArrayValue(options, "itemListIds"), 20, 100, true)
+            && IsValidScanValues(ArrayValue(options, "taxCodeListIds"), 20, 100, true);
+    }
+
+    private static string SanitizedComErrorCode(Exception error)
+    {
+        for (var current = error; current != null; current = current.InnerException)
+        {
+            var comError = current as COMException;
+            if (comError != null)
+            {
+                return "SDK_COM_" + unchecked((uint)comError.ErrorCode).ToString("X8", CultureInfo.InvariantCulture);
+            }
+        }
+        return null;
+    }
+
+    private static string SanitizedWorkerJsonFailureCode(string parserMessage, string input)
+    {
+        switch (parserMessage)
+        {
+            case "JSON size is invalid.": return "SDK_WORKER_JSON_SIZE_INVALID";
+            case "Unexpected end of JSON.": return "SDK_WORKER_JSON_UNEXPECTED_END";
+            case "Trailing JSON data.": return "SDK_WORKER_JSON_TRAILING_DATA";
+            case "JSON object key expected.": return "SDK_WORKER_JSON_OBJECT_KEY_INVALID";
+            case "Duplicate JSON key.": return "SDK_WORKER_JSON_DUPLICATE_KEY";
+            case "Invalid JSON structure.": return "SDK_WORKER_JSON_STRUCTURE_INVALID";
+            case "Invalid JSON value.":
+                if (!String.IsNullOrEmpty(input) && input[0] == '\uFEFF')
+                {
+                    return "SDK_WORKER_JSON_BOM_INVALID";
+                }
+                return "SDK_WORKER_JSON_VALUE_INVALID";
+            case "Invalid JSON number.": return "SDK_WORKER_JSON_NUMBER_INVALID";
+            case "Invalid JSON literal.": return "SDK_WORKER_JSON_LITERAL_INVALID";
+            case "Unterminated JSON string.": return "SDK_WORKER_JSON_STRING_UNTERMINATED";
+            case "JSON nesting is too deep.": return "SDK_WORKER_JSON_NESTING_TOO_DEEP";
+            case "Unescaped JSON control character.": return "SDK_WORKER_JSON_CONTROL_CHARACTER";
+            default: return "SDK_WORKER_JSON_INVALID";
+        }
+    }
+
+    private static bool IsSafeFailureStage(string value)
+    {
+        return new[]
+        {
+            "worker_request_read", "worker_request_parse", "worker_request_validation",
+            "sdk_diagnostic", "worker_response_serialization", "sdk_session_mutex",
+            "request_processor_activation", "open_connection", "begin_session",
+            "get_current_company_file", "qbxml_version_negotiation", "company_identity_query",
+            "company_preferences_query", "invoice_custom_fields_query", "item_uom_query", "reference_scan_query",
+            "reference_query", "reference_name_query", "diagnostic_worker_timeout", "diagnostic_worker_response",
+            "diagnostic_worker_launch"
+        }.Contains(value, StringComparer.Ordinal);
+    }
+
+    private static bool IsSafeSdkErrorCode(string value)
+    {
+        return value != null && Regex.IsMatch(value, "^SDK_COM_[A-F0-9]{8}$");
     }
 
     private static List<Dictionary<string, object>> QueryRecords(
@@ -1586,6 +2042,235 @@ internal static class Program
         return listIds.Select(id => records.ContainsKey(id)
             ? records[id]
             : new Dictionary<string, object> { { "listId", id }, { "found", false } }).ToList();
+    }
+
+    private static List<Dictionary<string, object>> RunReferenceScan(
+        dynamic processor,
+        string ticket,
+        string version,
+        Dictionary<string, object> options)
+    {
+        var categories = new List<Dictionary<string, object>>();
+        var customerPageLimitReached = false;
+        var itemPageLimitReached = false;
+        AddScanCategory(categories, "customers", "customer", 100, () =>
+            QueryAllNamedRecords(processor, ticket, "customer", version, 100, out customerPageLimitReached),
+            true, () => customerPageLimitReached);
+        AddScanCategory(categories, "items", "item", 100, () =>
+            QueryAllNamedRecords(processor, ticket, "item", version, 100, out itemPageLimitReached),
+            true, () => itemPageLimitReached);
+        AddScanCategory(categories, "inventory_sites", "local_exact_names", 20, () =>
+        {
+            var records = new List<Dictionary<string, object>>();
+            foreach (var name in ArrayValue(options, "siteNames").Select(value => (string)value))
+            {
+                records.AddRange(QueryRecordsByName(processor, ticket, "inventory_site", name, version));
+            }
+            return records;
+        }, false);
+        AddScanCategory(categories, "mapped_item_units", "saved_item_list_ids", 20, () =>
+            QueryItemUnits(
+                processor,
+                ticket,
+                ArrayValue(options, "itemListIds").Select(value => (string)value).ToList(),
+                version), false);
+        AddScanCategory(categories, "saved_tax_codes", "saved_tax_code_list_ids", 20, () =>
+            QueryRecords(
+                processor,
+                ticket,
+                "tax_code",
+                ArrayValue(options, "taxCodeListIds").Select(value => (string)value).ToList(),
+                version), false);
+        AddScanCategory(categories, "company_preferences", "company_preferences", 1, () =>
+            QueryCompanyPreferences(processor, ticket, version), false);
+        return categories;
+    }
+
+    private static void AddScanCategory(
+        List<Dictionary<string, object>> categories,
+        string name,
+        string scope,
+        int limit,
+        Func<List<Dictionary<string, object>>> query,
+        bool partialWhenLimitReached = true,
+        Func<bool> forcedPartial = null)
+    {
+        try
+        {
+            var records = query();
+            var partial = (partialWhenLimitReached && records.Count >= limit)
+                || (forcedPartial != null && forcedPartial());
+            categories.Add(new Dictionary<string, object>
+            {
+                { "category", name },
+                { "scope", scope },
+                { "status", partial ? "partial" : "complete" },
+                { "diagnosticCode", partial ? "SCAN_LIMIT_REACHED" : null },
+                { "recordCount", records.Count },
+                { "limit", limit },
+                { "records", records }
+            });
+        }
+        catch (Exception error)
+        {
+            var queryStatusError = error as QuickBooksQueryStatusException;
+            var diagnosticCode = queryStatusError == null
+                ? SanitizedComErrorCode(error) ?? "QBXML_QUERY_FAILED"
+                : queryStatusError.DiagnosticCode;
+            categories.Add(new Dictionary<string, object>
+            {
+                { "category", name },
+                { "scope", scope },
+                { "status", "failed" },
+                { "diagnosticCode", diagnosticCode },
+                { "recordCount", 0 },
+                { "limit", limit },
+                { "records", new List<object>() }
+            });
+        }
+    }
+
+    private static List<Dictionary<string, object>> QueryAllNamedRecords(
+        dynamic processor,
+        string ticket,
+        string entity,
+        string version,
+        int maximumRecords,
+        out bool pageLimitReached)
+    {
+        pageLimitReached = false;
+        if (entity != "customer" && entity != "item")
+            throw new InvalidDataException("Full-list scans are supported only for customers and items.");
+        var requestName = entity == "customer" ? "CustomerQueryRq" : "ItemQueryRq";
+        var responseName = entity == "customer" ? "CustomerQueryRs" : "ItemQueryRs";
+        var includeFields = entity == "customer"
+            ? new[] { "ListID", "Name", "FullName", "IsActive", "CompanyName", "CustomerTypeRef" }
+            : new[] { "ListID", "Name", "FullName", "IsActive", "ManufacturerPartNumber", "UnitOfMeasureSetRef" };
+        var records = new List<Dictionary<string, object>>();
+        var seenListIds = new HashSet<string>(StringComparer.Ordinal);
+        string iteratorId = null;
+        var remaining = 0;
+        var pageCount = 0;
+        do
+        {
+            pageCount++;
+            var iterator = iteratorId == null ? "Start" : "Continue";
+            XmlNode response = RunQuery(
+                processor,
+                ticket,
+                version,
+                BuildIteratorQuery(version, requestName, iterator, iteratorId, includeFields),
+                responseName);
+            if (response.Attributes["iteratorRemainingCount"] == null
+                || !Int32.TryParse(
+                    response.Attributes["iteratorRemainingCount"].Value,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out remaining)
+                || remaining < 0)
+            {
+                throw new InvalidDataException("QuickBooks returned invalid iterator status.");
+            }
+            iteratorId = response.Attributes["iteratorID"] == null
+                ? null
+                : response.Attributes["iteratorID"].Value;
+            foreach (XmlNode node in response.ChildNodes)
+            {
+                if (node.NodeType != XmlNodeType.Element || !node.LocalName.EndsWith("Ret", StringComparison.Ordinal))
+                    continue;
+                var listId = ChildText(node, "ListID");
+                var name = ChildText(node, "Name");
+                var fullName = ChildText(node, "FullName");
+                if (!IsValidListId(listId)
+                    || !IsBoundedString(name, entity == "customer" ? 41 : 31, false)
+                    || !IsBoundedString(fullName, entity == "customer" ? 209 : 159, false)
+                    || !seenListIds.Add(listId))
+                {
+                    throw new InvalidDataException("QuickBooks returned a malformed list-scan record.");
+                }
+                var record = new Dictionary<string, object>
+                {
+                    { "listId", listId },
+                    { "name", name },
+                    { "fullName", fullName },
+                    { "active", ParseActiveStatus(ChildText(node, "IsActive")) }
+                };
+                if (entity == "customer")
+                {
+                    var companyName = ChildText(node, "CompanyName");
+                    var typeRef = node.SelectSingleNode("./*[local-name()='CustomerTypeRef']");
+                    var customerType = typeRef == null ? null : ChildText(typeRef, "FullName");
+                    if ((companyName != null && companyName.Length > 41)
+                        || (customerType != null && customerType.Length > 159))
+                        throw new InvalidDataException("QuickBooks returned an oversized customer field.");
+                    record["companyName"] = companyName;
+                    record["customerType"] = customerType;
+                }
+                else
+                {
+                    var manufacturerPartNumber = ChildText(node, "ManufacturerPartNumber");
+                    var unitSet = node.SelectSingleNode("./*[local-name()='UnitOfMeasureSetRef']");
+                    var unitSetListId = unitSet == null ? null : ChildText(unitSet, "ListID");
+                    var unitSetName = unitSet == null ? null : ChildText(unitSet, "FullName");
+                    if ((manufacturerPartNumber != null && manufacturerPartNumber.Length > 31)
+                        || (unitSetListId != null && !IsValidListId(unitSetListId))
+                        || (unitSetName != null && unitSetName.Length > 159))
+                        throw new InvalidDataException("QuickBooks returned an oversized item field.");
+                    record["itemType"] = node.LocalName.Substring(0, node.LocalName.Length - 3);
+                    record["manufacturerPartNumber"] = manufacturerPartNumber;
+                    record["unitSetListId"] = unitSetListId;
+                    record["unitSetName"] = unitSetName;
+                }
+                records.Add(record);
+                if (records.Count >= maximumRecords)
+                {
+                    remaining = Math.Max(remaining, 1);
+                    pageLimitReached = true;
+                    break;
+                }
+            }
+            if (remaining > 0 && String.IsNullOrEmpty(iteratorId) && records.Count < maximumRecords)
+                throw new InvalidDataException("QuickBooks omitted the iterator ID while reporting more records.");
+            if (records.Count >= maximumRecords || remaining <= 0)
+                break;
+            if (pageCount >= 2)
+            {
+                pageLimitReached = true;
+                break;
+            }
+        } while (!String.IsNullOrEmpty(iteratorId));
+        return records;
+    }
+
+    private static string BuildIteratorQuery(
+        string version,
+        string requestName,
+        string iterator,
+        string iteratorId,
+        IEnumerable<string> includeFields)
+    {
+        var settings = new XmlWriterSettings { OmitXmlDeclaration = true, Encoding = new UTF8Encoding(false), Indent = false };
+        var builder = new StringBuilder();
+        builder.Append("<?xml version=\"1.0\" encoding=\"utf-8\"?><?qbxml version=\"").Append(version).Append("\"?>");
+        using (var writer = XmlWriter.Create(builder, settings))
+        {
+            writer.WriteStartElement("QBXML");
+            writer.WriteStartElement("QBXMLMsgsRq");
+            writer.WriteAttributeString("onError", "stopOnError");
+            writer.WriteStartElement(requestName);
+            writer.WriteAttributeString("requestID", "1");
+            writer.WriteAttributeString("iterator", iterator);
+            if (!String.IsNullOrEmpty(iteratorId))
+                writer.WriteAttributeString("iteratorID", iteratorId);
+            writer.WriteElementString("MaxReturned", "50");
+            writer.WriteElementString("ActiveStatus", "All");
+            foreach (var field in includeFields)
+                writer.WriteElementString("IncludeRetElement", field);
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+        }
+        return builder.ToString();
     }
 
     private static List<Dictionary<string, object>> QueryItemUnits(
@@ -1841,13 +2526,15 @@ internal static class Program
         string ticket,
         string entity,
         string searchName,
-        string version)
+        string version,
+        bool fullNameOnly = false)
     {
         if (entity != "customer" && entity != "item" && entity != "inventory_site")
             throw new InvalidDataException("Name lookup is supported only for customers, items, and inventory sites.");
         var config = QueryConfig.For(entity);
         var records = new Dictionary<string, Dictionary<string, object>>(StringComparer.Ordinal);
-        var queries = entity == "inventory_site"
+        var nameFilterMaxLength = entity == "customer" ? 41 : 31;
+        var queries = entity == "inventory_site" || fullNameOnly || searchName.Length > nameFilterMaxLength
             ? new[] { BuildNameQuery(version, config.RequestName, searchName, true) }
             : new[]
         {
@@ -1859,12 +2546,21 @@ internal static class Program
             var response = (string)processor.ProcessRequest(ticket, query);
             var document = LoadSafeXml(response);
             var queryResponse = document.SelectSingleNode("//" + config.ResponseName);
-            if (queryResponse == null
-                || !String.Equals(
-                    queryResponse.Attributes["statusCode"] == null ? null : queryResponse.Attributes["statusCode"].Value,
-                    "0",
-                    StringComparison.Ordinal))
+            if (queryResponse == null)
             {
+                throw new InvalidDataException("QuickBooks returned an unsuccessful read-only name query.");
+            }
+            var statusCode = queryResponse.Attributes["statusCode"] == null
+                ? null
+                : queryResponse.Attributes["statusCode"].Value;
+            if (!String.Equals(statusCode, "0", StringComparison.Ordinal))
+            {
+                int numericStatusCode;
+                if (Int32.TryParse(statusCode, NumberStyles.None, CultureInfo.InvariantCulture, out numericStatusCode)
+                    && numericStatusCode > 0)
+                {
+                    throw new QuickBooksQueryStatusException(numericStatusCode);
+                }
                 throw new InvalidDataException("QuickBooks returned an unsuccessful read-only name query.");
             }
 
@@ -2022,7 +2718,7 @@ internal static class Program
             {
                 writer.WriteElementString("MaxReturned", (MaxListIds + 1).ToString(CultureInfo.InvariantCulture));
                 writer.WriteStartElement("NameFilter");
-                writer.WriteElementString("MatchCriterion", "Equal");
+                writer.WriteElementString("MatchCriterion", "StartsWith");
                 writer.WriteElementString("Name", name);
                 writer.WriteEndElement();
             }
@@ -2363,6 +3059,24 @@ internal static class Program
 
         var valid = "{\"operation\":\"health\",\"requestId\":\"11111111-1111-4111-8111-111111111111\"}";
         check(StrictJsonParser.Parse(valid) is Dictionary<string, object>, "strict JSON parser accepts the PHP health request shape");
+        var workerRequestJson = Json.Serialize(new Dictionary<string, object>
+        {
+            { "entity", "company_preferences" },
+            { "listIds", new List<string>() },
+            { "searchName", null }
+        });
+        var workerRequest = StrictJsonParser.Parse(workerRequestJson) as Dictionary<string, object>;
+        check(workerRequest != null
+            && IsValidDiagnosticWorkerRequest(
+                StringValue(workerRequest, "entity"),
+                ArrayValue(workerRequest, "listIds"),
+                StringValue(workerRequest, "searchName")),
+            "serialized company-preferences worker request parses and validates without reference ListIDs");
+        check(SanitizedWorkerJsonFailureCode("Invalid JSON value.", "\uFEFF{}")
+                == "SDK_WORKER_JSON_BOM_INVALID"
+            && SanitizedWorkerJsonFailureCode("Invalid JSON value.", "?")
+                == "SDK_WORKER_JSON_VALUE_INVALID",
+            "worker JSON parser failures are classified without returning input contents");
         var duplicateRejected = false;
         try { StrictJsonParser.Parse("{\"operation\":\"health\",\"operation\":\"diagnose\"}"); }
         catch (FormatException) { duplicateRejected = true; }
@@ -2435,6 +3149,13 @@ internal static class Program
             && !StringValue(sdkComFailure, "message").Contains("Sensitive")
             && !StringValue(sdkComFailure, "message").Contains("company data"),
             "company identity diagnostic preserves a nested COM HRESULT without exposing exception text");
+        var sanitizedWorkerComCode = SanitizedComErrorCode(new InvalidOperationException(
+            "Sensitive wrapper message",
+            new COMException("Sensitive SDK message", unchecked((int)0x80040418))));
+        check(sanitizedWorkerComCode == "SDK_COM_80040418"
+            && IsSafeFailureStage("begin_session")
+            && !IsSafeFailureStage("C:\\Sensitive\\Company.qbw"),
+            "diagnostic worker reports only allowlisted stages and sanitized SDK HRESULTs");
         var rejectedCompanyQuery = false;
         try
         {
@@ -2467,6 +3188,7 @@ internal static class Program
             { "requestId", "11111111-1111-4111-8111-111111111111" },
             { "operation", "submit" },
             { "transactionType", "invoice" },
+            { "preparationMode", "legacy_mapped" },
             { "idempotencyKey", new string('a', 64) },
             { "source", new Dictionary<string, object>
                 {
@@ -2490,6 +3212,7 @@ internal static class Program
                                 { "quantity", "2" },
                                 { "rate", "10.00" },
                                 { "expectedAmount", "20.00" },
+                                { "pricingSource", "mfc_entered" },
                                 { "salesTaxCode", new Dictionary<string, object> { { "listId", "TAX-1" } } },
                                 { "site", "Main Warehouse" },
                                 { "lotNumber", "LOT-1" },
@@ -2504,6 +3227,46 @@ internal static class Program
             }
         };
         check(ValidateSubmitRequest(validSubmitRequest), "invoice submit contract accepts an in-range SDK reference");
+        var firstSubmitLine = (Dictionary<string, object>)ArrayValue(ObjectValue(validSubmitRequest, "transaction"), "lines")[0];
+        firstSubmitLine["pricingSource"] = "quickbooks_verified";
+        check(!ValidateSubmitRequest(validSubmitRequest),
+            "bridge rejects QuickBooks fallback prices without a supported verified-pricing evidence contract");
+        var submitPricingTransaction = ObjectValue(validSubmitRequest, "transaction");
+        var submitLines = ArrayValue(submitPricingTransaction, "lines");
+        firstSubmitLine["pricingSource"] = "explicit_zero";
+        firstSubmitLine["rate"] = "0.00";
+        firstSubmitLine["expectedAmount"] = "0.00";
+        submitPricingTransaction["expectedSubtotal"] = "0.00";
+        check(ValidateSubmitRequest(validSubmitRequest),
+            "bridge accepts an explicitly zero-priced invoice line with a matching zero amount");
+        var zeroRateXml = BuildInvoiceAddRequest(validSubmitRequest, "16.0");
+        check(zeroRateXml.Contains("<Rate>0.00</Rate>")
+            && zeroRateXml.Contains("<Amount>0.00</Amount>"),
+            "InvoiceAdd XML serializes explicit zero Rate and Amount instead of omitting the rate");
+        firstSubmitLine["rate"] = "1.00";
+        firstSubmitLine["expectedAmount"] = "2.00";
+        check(!ValidateSubmitRequest(validSubmitRequest),
+            "bridge rejects an explicit-zero source paired with a non-zero rate");
+        firstSubmitLine["rate"] = "0.00";
+        firstSubmitLine["expectedAmount"] = "0.00";
+        var secondSubmitLine = new Dictionary<string, object>(firstSubmitLine);
+        secondSubmitLine["pricingSource"] = "mfc_entered";
+        secondSubmitLine["quantity"] = "1";
+        secondSubmitLine["rate"] = "5.00";
+        secondSubmitLine["expectedAmount"] = "5.00";
+        submitLines.Add(secondSubmitLine);
+        submitPricingTransaction["expectedSubtotal"] = "5.00";
+        var mixedRateXml = BuildInvoiceAddRequest(validSubmitRequest, "16.0");
+        check(ValidateSubmitRequest(validSubmitRequest)
+            && mixedRateXml.Split(new[] { "<InvoiceLineAdd>" }, StringSplitOptions.None).Length - 1 == 2
+            && mixedRateXml.IndexOf("<Rate>0.00</Rate>", StringComparison.Ordinal)
+                < mixedRateXml.IndexOf("<Rate>5.00</Rate>", StringComparison.Ordinal),
+            "InvoiceAdd preserves the order of multiple lines with zero and positive rates");
+        submitLines.RemoveAt(1);
+        firstSubmitLine["pricingSource"] = "mfc_entered";
+        firstSubmitLine["rate"] = "10.00";
+        firstSubmitLine["expectedAmount"] = "20.00";
+        submitPricingTransaction["expectedSubtotal"] = "20.00";
         var inactiveCustomerProcessor = new FakeQueryProcessor(
             "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\"><CustomerRet><ListID>CUST-1</ListID><Name>Mock Customer</Name><FullName>Mock Customer</FullName><IsActive>false</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>");
         var inactiveCustomer = VerifyInvoiceReferences(inactiveCustomerProcessor, "test-ticket", "16.0", validSubmitRequest);
@@ -2515,8 +3278,8 @@ internal static class Program
         var activeInvoiceProcessor = new FakeQueryProcessor(
             "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\"><CustomerRet><ListID>CUST-1</ListID><Name>Mock Customer</Name><FullName>Mock Customer</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>",
             "<QBXML><QBXMLMsgsRs><ItemQueryRs statusCode=\"0\"><ItemInventoryRet><ListID>ITEM-1</ListID><Name>Mock Item</Name><FullName>Mock Item</FullName><IsActive>true</IsActive><ManufacturerPartNumber>MPN-1</ManufacturerPartNumber></ItemInventoryRet></ItemQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><PreferencesQueryRs statusCode=\"0\"><PreferencesRet><SalesTaxPreferences></SalesTaxPreferences><MultiLocationInventoryPreferences><IsMultiLocationInventoryAvailable>true</IsMultiLocationInventoryAvailable><IsMultiLocationInventoryEnabled>true</IsMultiLocationInventoryEnabled></MultiLocationInventoryPreferences><ItemsAndInventoryPreferences><IsTrackingSerialOrLotNumber>LotNumber</IsTrackingSerialOrLotNumber></ItemsAndInventoryPreferences></PreferencesRet></PreferencesQueryRs></QBXMLMsgsRs></QBXML>",
             "<QBXML><QBXMLMsgsRs><SalesTaxCodeQueryRs statusCode=\"0\"><SalesTaxCodeRet><ListID>TAX-1</ListID><Name>Tax</Name><IsActive>true</IsActive></SalesTaxCodeRet></SalesTaxCodeQueryRs></QBXMLMsgsRs></QBXML>",
-            "<QBXML><QBXMLMsgsRs><PreferencesQueryRs statusCode=\"0\"><PreferencesRet><SalesTaxPreferences><IsUsingCustomerTaxCode>true</IsUsingCustomerTaxCode></SalesTaxPreferences><MultiLocationInventoryPreferences><IsMultiLocationInventoryAvailable>true</IsMultiLocationInventoryAvailable><IsMultiLocationInventoryEnabled>true</IsMultiLocationInventoryEnabled></MultiLocationInventoryPreferences><ItemsAndInventoryPreferences><IsTrackingSerialOrLotNumber>LotNumber</IsTrackingSerialOrLotNumber></ItemsAndInventoryPreferences></PreferencesRet></PreferencesQueryRs></QBXMLMsgsRs></QBXML>",
             "<QBXML><QBXMLMsgsRs><InventorySiteQueryRs statusCode=\"0\"><InventorySiteRet><ListID>SITE-1</ListID><Name>Main Warehouse</Name><FullName>Main Warehouse</FullName><IsActive>true</IsActive></InventorySiteRet></InventorySiteQueryRs></QBXMLMsgsRs></QBXML>",
             "<QBXML><QBXMLMsgsRs><ItemQueryRs statusCode=\"0\"><ItemInventoryRet><ListID>ITEM-1</ListID><Name>Mock Item</Name><FullName>Mock Item</FullName><IsActive>true</IsActive><UnitOfMeasureSetRef><ListID>UOM-1</ListID><FullName>Box Set</FullName></UnitOfMeasureSetRef></ItemInventoryRet></ItemQueryRs></QBXMLMsgsRs></QBXML>",
             "<QBXML><QBXMLMsgsRs><UnitOfMeasureSetQueryRs statusCode=\"0\"><UnitOfMeasureSetRet><ListID>UOM-1</ListID><IsActive>true</IsActive><UnitOfMeasureType>Count</UnitOfMeasureType><BaseUnit><Name>Box</Name><Abbreviation>box</Abbreviation></BaseUnit><DefaultUnit><UnitUsedFor>Sales</UnitUsedFor><Unit>Box</Unit></DefaultUnit></UnitOfMeasureSetRet></UnitOfMeasureSetQueryRs></QBXMLMsgsRs></QBXML>");
@@ -2524,11 +3287,92 @@ internal static class Program
         check(activeInvoiceReferences == null
             && activeInvoiceProcessor.Requests.Count == 7
             && activeInvoiceProcessor.Requests.All(request => request.Contains("QueryRq") && !request.Contains("AddRq")),
-            "mock active customer, item, tax, site, lot preference, and sales U/M references pass preflight using read-only queries"
+            "mock active customer, item, tax, site, lot preference, and sales U/M references pass with an unknown customer-tax-code preference"
             + (activeInvoiceReferences == null
                 ? " (requests=" + activeInvoiceProcessor.Requests.Count + ")"
                 : " (" + activeInvoiceReferences.Item1 + ": " + activeInvoiceReferences.Item2
                     + "; requests=" + activeInvoiceProcessor.Requests.Count + ")"));
+        validSubmitRequest["preparationMode"] = "quickbooks_managed_defaults";
+        var managedLines = ArrayValue(ObjectValue(validSubmitRequest, "transaction"), "lines");
+        var managedLine = (Dictionary<string, object>)managedLines[0];
+        managedLine.Remove("salesTaxCode");
+        ObjectValue(validSubmitRequest, "transaction")["expectedSubtotal"] = "20.00";
+        var managedInvoiceProcessor = new FakeQueryProcessor(
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\"><CustomerRet><ListID>CUST-1</ListID><Name>Mock Customer</Name><FullName>Mock Customer</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><ItemQueryRs statusCode=\"0\"><ItemInventoryRet><ListID>ITEM-1</ListID><Name>Mock Item</Name><FullName>Mock Item</FullName><IsActive>true</IsActive></ItemInventoryRet></ItemQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><PreferencesQueryRs statusCode=\"0\"><PreferencesRet><SalesTaxPreferences><IsUsingCustomerTaxCode>true</IsUsingCustomerTaxCode><DefaultTaxableSalesTaxCodeRef><ListID>TAX-1</ListID></DefaultTaxableSalesTaxCodeRef><DefaultNonTaxableSalesTaxCodeRef><ListID>TAX-1</ListID></DefaultNonTaxableSalesTaxCodeRef></SalesTaxPreferences><MultiLocationInventoryPreferences><IsMultiLocationInventoryAvailable>true</IsMultiLocationInventoryAvailable><IsMultiLocationInventoryEnabled>true</IsMultiLocationInventoryEnabled></MultiLocationInventoryPreferences><ItemsAndInventoryPreferences><IsTrackingSerialOrLotNumber>LotNumber</IsTrackingSerialOrLotNumber></ItemsAndInventoryPreferences></PreferencesRet></PreferencesQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><SalesTaxCodeQueryRs statusCode=\"0\"><SalesTaxCodeRet><ListID>TAX-1</ListID><Name>Tax</Name><IsActive>true</IsActive></SalesTaxCodeRet></SalesTaxCodeQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><SalesTaxCodeQueryRs statusCode=\"0\"><SalesTaxCodeRet><ListID>TAX-1</ListID><Name>Tax</Name><IsActive>true</IsActive></SalesTaxCodeRet></SalesTaxCodeQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><InventorySiteQueryRs statusCode=\"0\"><InventorySiteRet><ListID>SITE-1</ListID><Name>Main Warehouse</Name><FullName>Main Warehouse</FullName><IsActive>true</IsActive></InventorySiteRet></InventorySiteQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><ItemQueryRs statusCode=\"0\"><ItemInventoryRet><ListID>ITEM-1</ListID><Name>Mock Item</Name><FullName>Mock Item</FullName><IsActive>true</IsActive><UnitOfMeasureSetRef><ListID>UOM-1</ListID><FullName>Box Set</FullName></UnitOfMeasureSetRef></ItemInventoryRet></ItemQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><UnitOfMeasureSetQueryRs statusCode=\"0\"><UnitOfMeasureSetRet><ListID>UOM-1</ListID><IsActive>true</IsActive><UnitOfMeasureType>Count</UnitOfMeasureType><BaseUnit><Name>Box</Name><Abbreviation>box</Abbreviation></BaseUnit><DefaultUnit><UnitUsedFor>Sales</UnitUsedFor><Unit>Box</Unit></DefaultUnit></UnitOfMeasureSetRet></UnitOfMeasureSetQueryRs></QBXMLMsgsRs></QBXML>");
+        var managedPreflight = VerifyInvoiceReferences(managedInvoiceProcessor, "test-ticket", "16.0", validSubmitRequest);
+        check(managedPreflight == null
+            && managedInvoiceProcessor.Requests.All(request => request.Contains("QueryRq") && !request.Contains("AddRq")),
+            "managed-defaults preflight verifies company tax defaults and exact inventory/U/M references using read-only queries");
+        managedLine["salesTaxCode"] =
+            new Dictionary<string, object> { { "listId", "TAX-1" } };
+        ObjectValue(validSubmitRequest, "transaction")["expectedSubtotal"] = "20.00";
+        validSubmitRequest["preparationMode"] = "legacy_mapped";
+        var submitTransactionForNames = ObjectValue(validSubmitRequest, "transaction");
+        var submitCustomer = ObjectValue(submitTransactionForNames, "customer");
+        var submitLine = (Dictionary<string, object>)ArrayValue(submitTransactionForNames, "lines")[0];
+        var submitItem = ObjectValue(submitLine, "item");
+        SetInvoiceReferenceFullName(submitCustomer, "Parent & Co:Customer");
+        SetInvoiceReferenceFullName(submitItem, "Food & Supply:Chicken");
+        submitLine["lotNumber"] = null;
+        submitLine["unitOfMeasure"] = null;
+        check(ValidateSubmitRequest(validSubmitRequest),
+            "invoice submit contract accepts explicit FullName references alongside legacy ListIDs");
+        submitCustomer.Add("listId", "CUST-1");
+        check(!ValidateSubmitRequest(validSubmitRequest),
+            "invoice submit contract rejects references that contain both ListID and FullName");
+        submitCustomer.Remove("listId");
+        var exactCustomerXml = "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\"><CustomerRet><ListID>CUST-EXACT</ListID><Name>Customer</Name><FullName>Parent &amp; Co:Customer</FullName><IsActive>true</IsActive><CompanyName>Parent &amp; Co</CompanyName></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>";
+        var exactItemXml = "<QBXML><QBXMLMsgsRs><ItemQueryRs statusCode=\"0\"><ItemInventoryRet><ListID>ITEM-EXACT</ListID><Name>Chicken</Name><FullName>Food &amp; Supply:Chicken</FullName><IsActive>true</IsActive><ManufacturerPartNumber>CHICKEN-1</ManufacturerPartNumber><SalesDesc>Chicken</SalesDesc></ItemInventoryRet></ItemQueryRs></QBXMLMsgsRs></QBXML>";
+        var fullnameInvoiceProcessor = new FakeQueryProcessor(
+            exactCustomerXml,
+            exactItemXml,
+            "<QBXML><QBXMLMsgsRs><PreferencesQueryRs statusCode=\"0\"><PreferencesRet><SalesTaxPreferences><IsUsingCustomerTaxCode>true</IsUsingCustomerTaxCode></SalesTaxPreferences><MultiLocationInventoryPreferences><IsMultiLocationInventoryAvailable>true</IsMultiLocationInventoryAvailable><IsMultiLocationInventoryEnabled>true</IsMultiLocationInventoryEnabled></MultiLocationInventoryPreferences></PreferencesRet></PreferencesQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><SalesTaxCodeQueryRs statusCode=\"0\"><SalesTaxCodeRet><ListID>TAX-1</ListID><Name>Tax</Name><IsActive>true</IsActive></SalesTaxCodeRet></SalesTaxCodeQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><InventorySiteQueryRs statusCode=\"0\"><InventorySiteRet><ListID>SITE-1</ListID><Name>Main Warehouse</Name><FullName>Main Warehouse</FullName><IsActive>true</IsActive></InventorySiteRet></InventorySiteQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><ItemQueryRs statusCode=\"0\"><ItemInventoryRet><ListID>ITEM-EXACT</ListID><Name>Chicken</Name><FullName>Food &amp; Supply:Chicken</FullName><IsActive>true</IsActive></ItemInventoryRet></ItemQueryRs></QBXMLMsgsRs></QBXML>");
+        var fullnameReferences = VerifyInvoiceReferences(fullnameInvoiceProcessor, "test-ticket", "16.0", validSubmitRequest);
+        var fullnameXml = BuildInvoiceAddRequest(validSubmitRequest, "16.0");
+        check(fullnameReferences == null
+            && fullnameInvoiceProcessor.Requests.Count == 6
+            && StringValue(submitCustomer, "listId") == "CUST-EXACT"
+            && StringValue(submitItem, "listId") == "ITEM-EXACT"
+            && fullnameInvoiceProcessor.Requests.All(request => request.Contains("QueryRq") && !request.Contains("AddRq"))
+            && fullnameXml.Contains("<CustomerRef><ListID>CUST-EXACT</ListID></CustomerRef>")
+            && fullnameXml.Contains("<ItemRef><ListID>ITEM-EXACT</ListID></ItemRef>")
+            && !fullnameXml.Contains("Parent &amp; Co:Customer"),
+            "exact hierarchical FullNames resolve to active ListIDs before InvoiceAdd XML is built");
+        SetInvoiceReferenceListId(submitCustomer, "CUST-1");
+        SetInvoiceReferenceListId(submitItem, "ITEM-1");
+        submitLine["lotNumber"] = "LOT-1";
+        submitLine["unitOfMeasure"] = "Box";
+        var hierarchyMismatchXml = "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\"><CustomerRet><ListID>CUST-PARENT</ListID><Name>Customer</Name><FullName>Parent:Customer</FullName><IsActive>true</IsActive><CompanyName>Parent</CompanyName></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>";
+        string hierarchyError;
+        var hierarchyMatch = ResolveInvoiceReference(
+            new FakeQueryProcessor(hierarchyMismatchXml),
+            "test-ticket",
+            "16.0",
+            "customer",
+            new Dictionary<string, object> { { "fullName", "Customer" } },
+            out hierarchyError);
+        check(hierarchyMatch == null && hierarchyError == "CUSTOMER_FULLNAME_NOT_FOUND",
+            "a customer Name match with a different hierarchical FullName is rejected");
+        var duplicateFullNameXml = "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\"><CustomerRet><ListID>CUST-DUP-1</ListID><Name>Customer</Name><FullName>Parent:Customer</FullName><IsActive>true</IsActive></CustomerRet><CustomerRet><ListID>CUST-DUP-2</ListID><Name>Customer</Name><FullName>Parent:Customer</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>";
+        var ambiguousFullName = ResolveInvoiceReference(
+            new FakeQueryProcessor(duplicateFullNameXml),
+            "test-ticket",
+            "16.0",
+            "customer",
+            new Dictionary<string, object> { { "fullName", "Parent:Customer" } },
+            out hierarchyError);
+        check(ambiguousFullName == null && hierarchyError == "CUSTOMER_FULLNAME_AMBIGUOUS",
+            "duplicate records with the same exact FullName are rejected as ambiguous");
         var submitTransaction = ObjectValue(validSubmitRequest, "transaction");
         submitTransaction["refNumber"] = new string('R', 12);
         check(!ValidateSubmitRequest(validSubmitRequest), "invoice submit contract rejects RefNumber over 11 characters");
@@ -2546,6 +3390,7 @@ internal static class Program
             { "quantity", "1" },
             { "rate", "5.00" },
             { "expectedAmount", "5.00" },
+            { "pricingSource", "mfc_entered" },
             { "salesTaxCode", new Dictionary<string, object> { { "listId", "TAX-1" } } },
             { "site", "Main Warehouse" },
             { "lotNumber", null },
@@ -2569,6 +3414,30 @@ internal static class Program
             && invoiceXml.Contains("<TxnDate>2026-10-23</TxnDate>")
             && invoiceXml.Contains("<RefNumber>INV-1</RefNumber>"),
             "InvoiceAdd XML uses ListID references and the validated date and reference");
+        validSubmitRequest["preparationMode"] = "quickbooks_managed_defaults";
+        foreach (var value in lines)
+            ((Dictionary<string, object>)value).Remove("salesTaxCode");
+        check(ValidateSubmitRequest(validSubmitRequest),
+            "managed-defaults submit contract accepts invoices without line tax-code mappings");
+        var managedInvoiceXml = BuildInvoiceAddRequest(validSubmitRequest, "16.0");
+        check(!managedInvoiceXml.Contains("SalesTaxCodeRef")
+            && managedInvoiceXml.Contains("<Rate>10.00</Rate>")
+            && managedInvoiceXml.Contains("<Amount>20.00</Amount>")
+            && managedInvoiceXml.Contains("<Quantity>2</Quantity>"),
+            "managed-defaults InvoiceAdd omits tax references while preserving explicit quantity and price");
+        var firstManagedLine = (Dictionary<string, object>)lines[0];
+        firstManagedLine["rate"] = "0.00";
+        firstManagedLine["expectedAmount"] = "0.00";
+        submitTransaction["expectedSubtotal"] = "5.00";
+        check(ValidateSubmitRequest(validSubmitRequest)
+            && BuildInvoiceAddRequest(validSubmitRequest, "16.0").Contains("<Rate>0.00</Rate>"),
+            "managed-defaults submit contract accepts and serializes explicit zero-priced lines");
+        firstManagedLine["rate"] = "10.00";
+        firstManagedLine["expectedAmount"] = "20.00";
+        submitTransaction["expectedSubtotal"] = "20.00";
+        validSubmitRequest["preparationMode"] = "legacy_mapped";
+        foreach (var value in lines)
+            ((Dictionary<string, object>)value)["salesTaxCode"] = new Dictionary<string, object> { { "listId", "TAX-1" } };
         submitTransaction["expectedSubtotal"] = "20.00";
         submitTransaction["expirationDate"] = "2026-12-31";
         ((Dictionary<string, object>)lines[0])["expirationDate"] = "2026-12-31";
@@ -2718,6 +3587,31 @@ internal static class Program
         check(ValidateDiagnosticRequest(preferencesRequest, out ignoredEntity, out ignoredIds, out ignoredName)
             && ignoredIds == null,
             "company preference diagnostics do not accept caller-controlled query filters");
+        var scanRequest = new Dictionary<string, object>
+        {
+            { "operation", "diagnose" },
+            { "requestId", "88888888-8888-4888-8888-888888888888" },
+            { "entity", "reference_scan" },
+            { "siteNames", new List<object> { "Warehouse:North" } },
+            { "itemListIds", new List<object> { "ITEM-1" } },
+            { "taxCodeListIds", new List<object> { "TAX-1" } }
+        };
+        check(ValidateDiagnosticRequest(scanRequest, out ignoredEntity, out ignoredIds, out ignoredName)
+            && ignoredIds == null
+            && IsValidDiagnosticWorkerRequest("reference_scan", new List<object>(), null)
+            && IsValidWorkerScanOptions(ReadReferenceScanOptions(scanRequest)),
+            "reference scan accepts bounded known-reference scopes and requires no transaction fields");
+        ((List<object>)scanRequest["siteNames"]).Add("Warehouse:North");
+        check(!ValidateDiagnosticRequest(scanRequest, out ignoredEntity, out ignoredIds, out ignoredName),
+            "reference scan rejects duplicate exact site names");
+        var noListIds = new List<object>();
+        check(IsValidDiagnosticWorkerRequest("company_preferences", noListIds, null)
+            && IsValidDiagnosticWorkerRequest("invoice_custom_fields", noListIds, null)
+            && !IsValidDiagnosticWorkerRequest("customer", noListIds, null),
+            "diagnostic worker accepts allowlisted company queries without ListIDs and still requires IDs for reference queries");
+        check(IsValidDiagnosticWorkerRequest("item", noListIds, "Product Name")
+            && !IsValidDiagnosticWorkerRequest("company_preferences", noListIds, "Product Name"),
+            "diagnostic worker keeps name searches limited to reference entities");
         preferencesRequest["listIds"] = new List<object> { "CUST-1" };
         check(!ValidateDiagnosticRequest(preferencesRequest, out ignoredEntity, out ignoredIds, out ignoredName),
             "company preference diagnostics reject unexpected ListIDs");
@@ -2742,12 +3636,12 @@ internal static class Program
         var broadNameQuery = BuildNameQuery("16.0", "ItemQueryRq", "Item & Description", false);
         var fullNameQuery = BuildNameQuery("16.0", "ItemQueryRq", "Parent:Item", true);
         check(broadNameQuery.Contains("<MaxReturned>51</MaxReturned>")
-            && broadNameQuery.Contains("<MatchCriterion>Equal</MatchCriterion>")
+            && broadNameQuery.Contains("<MatchCriterion>StartsWith</MatchCriterion>")
             && broadNameQuery.Contains("<Name>Item &amp; Description</Name>")
             && broadNameQuery.Contains("<IncludeRetElement>ManufacturerPartNumber</IncludeRetElement>")
             && broadNameQuery.Contains("<IncludeRetElement>SalesDesc</IncludeRetElement>")
             && !broadNameQuery.Contains("AddRq"),
-            "item name lookup uses a bounded exact NameFilter and returns item metadata without writes");
+            "item name lookup uses a bounded SDK-supported NameFilter and returns item metadata without writes");
         check(fullNameQuery.Contains("<FullName>Parent:Item</FullName>")
             && !fullNameQuery.Contains("<NameFilter>")
             && fullNameQuery.Contains("<IncludeRetElement>ManufacturerPartNumber</IncludeRetElement>"),
@@ -2757,6 +3651,21 @@ internal static class Program
         check(customerNameQuery.Contains("<IncludeRetElement>CompanyName</IncludeRetElement>")
             && customerFullNameQuery.Contains("<FullName>Parent:Customer</FullName>"),
             "customer queries retrieve CompanyName and support exact FullName lookup");
+        var failedNameProcessor = new FakeQueryProcessor(
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"3140\" statusSeverity=\"Error\" statusMessage=\"Sensitive QuickBooks response text\"><CustomerRet/></CustomerQueryRs></QBXMLMsgsRs></QBXML>");
+        string failedNameDiagnosticCode = null;
+        try
+        {
+            QueryRecordsByName(failedNameProcessor, "test-ticket", "customer", "Customer", "16.0");
+        }
+        catch (QuickBooksQueryStatusException error)
+        {
+            failedNameDiagnosticCode = error.DiagnosticCode;
+        }
+        check(failedNameDiagnosticCode == "QBXML_QUERY_STATUS_3140"
+            && failedNameProcessor.Requests.Count == 1
+            && IsSafeFailureStage("reference_name_query"),
+            "name-query failures expose only the numeric QBXML status and a safe name-query stage");
         var siteQuery = BuildNameQuery("16.0", "InventorySiteQueryRq", "Warehouse:North", true);
         check(siteQuery.Contains("<FullName>Warehouse:North</FullName>")
             && siteQuery.Contains("<IncludeRetElement>IsActive</IncludeRetElement>")
@@ -2764,6 +3673,56 @@ internal static class Program
             && !siteQuery.Contains("ManufacturerPartNumber")
             && !siteQuery.Contains("AddRq"),
             "inventory-site lookup uses exact FullName and only read-only supported fields");
+        var iteratorQuery = BuildIteratorQuery(
+            "16.0",
+            "CustomerQueryRq",
+            "Continue",
+            "ITER-1",
+            new[] { "ListID", "Name", "FullName", "IsActive" });
+        check(iteratorQuery.Contains("iterator=\"Continue\"")
+            && iteratorQuery.Contains("iteratorID=\"ITER-1\"")
+            && iteratorQuery.Contains("<MaxReturned>50</MaxReturned>")
+            && iteratorQuery.Contains("<ActiveStatus>All</ActiveStatus>")
+            && !iteratorQuery.Contains("AddRq"),
+            "full customer and item scans use bounded read-only iterator pages");
+        var pagedCustomerProcessor = new FakeQueryProcessor(
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\" iteratorRemainingCount=\"1\" iteratorID=\"ITER-1\"><CustomerRet><ListID>CUST-1</ListID><Name>Customer One</Name><FullName>Customer One</FullName><IsActive>true</IsActive><CompanyName>Customer One LLC</CompanyName></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\" iteratorRemainingCount=\"0\" iteratorID=\"ITER-1\"><CustomerRet><ListID>CUST-2</ListID><Name>Customer Two</Name><FullName>Customer Two</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>");
+        bool customerPageLimitReached;
+        var pagedCustomers = QueryAllNamedRecords(
+            pagedCustomerProcessor,
+            "test-ticket",
+            "customer",
+            "16.0",
+            10,
+            out customerPageLimitReached);
+        check(pagedCustomers.Count == 2
+            && !customerPageLimitReached
+            && pagedCustomerProcessor.Requests.Count == 2
+            && pagedCustomerProcessor.Requests[0].Contains("iterator=\"Start\"")
+            && pagedCustomerProcessor.Requests[1].Contains("iterator=\"Continue\"")
+            && pagedCustomerProcessor.Requests[1].Contains("iteratorID=\"ITER-1\"")
+            && pagedCustomerProcessor.Requests.All(request => request.Contains("QueryRq") && !request.Contains("AddRq")),
+            "mock customer enumeration follows iterator IDs and remains read-only");
+        var cappedCustomerProcessor = new FakeQueryProcessor(
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\" iteratorRemainingCount=\"50\" iteratorID=\"ITER-2\"><CustomerRet><ListID>CUST-1</ListID><Name>Customer One</Name><FullName>Customer One</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>",
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\" iteratorRemainingCount=\"49\" iteratorID=\"ITER-2\"><CustomerRet><ListID>CUST-2</ListID><Name>Customer Two</Name><FullName>Customer Two</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>");
+        var cappedCustomers = QueryAllNamedRecords(
+            cappedCustomerProcessor,
+            "test-ticket",
+            "customer",
+            "16.0",
+            100,
+            out customerPageLimitReached);
+        check(cappedCustomers.Count == 2 && customerPageLimitReached && cappedCustomerProcessor.Requests.Count == 2,
+            "customer enumeration marks the page cap as partial instead of looping or claiming completeness");
+        var missingIteratorProcessor = new FakeQueryProcessor(
+            "<QBXML><QBXMLMsgsRs><CustomerQueryRs statusCode=\"0\" iteratorRemainingCount=\"1\"><CustomerRet><ListID>CUST-1</ListID><Name>Customer One</Name><FullName>Customer One</FullName><IsActive>true</IsActive></CustomerRet></CustomerQueryRs></QBXMLMsgsRs></QBXML>");
+        var missingIteratorRejected = false;
+        try { QueryAllNamedRecords(missingIteratorProcessor, "test-ticket", "customer", "16.0", 10, out customerPageLimitReached); }
+        catch (InvalidDataException) { missingIteratorRejected = true; }
+        check(missingIteratorRejected,
+            "customer scans fail rather than report complete when QuickBooks indicates more records without an iterator ID");
         var preferencesQuery = BuildEmptyQuery("16.0", "PreferencesQueryRq");
         var customFieldsQuery = BuildFilteredQuery("16.0", "DataExtDefQueryRq", "AssignToObject", "Invoice");
         var unitItemQuery = BuildQueryXml(
@@ -2931,6 +3890,8 @@ internal static class Program
         public string Status;
         public string Code;
         public Dictionary<string, object> Data;
+        public string FailureStage;
+        public string SdkErrorCode;
 
         public static DiagnosticResult Ready(
             string entity,
@@ -2953,9 +3914,20 @@ internal static class Program
             return new DiagnosticResult { StatusCode = 200, Status = "ok", Data = data };
         }
 
-        public static DiagnosticResult Unavailable(string code)
+        public static DiagnosticResult Unavailable(string code, string failureStage = null, string sdkErrorCode = null)
         {
-            return new DiagnosticResult { StatusCode = 503, Status = "unavailable", Code = code };
+            var data = new Dictionary<string, object>();
+            if (!String.IsNullOrEmpty(failureStage)) data["failureStage"] = failureStage;
+            if (!String.IsNullOrEmpty(sdkErrorCode)) data["sdkErrorCode"] = sdkErrorCode;
+            return new DiagnosticResult
+            {
+                StatusCode = 503,
+                Status = "unavailable",
+                Code = code,
+                Data = data.Count == 0 ? null : data,
+                FailureStage = failureStage,
+                SdkErrorCode = sdkErrorCode
+            };
         }
     }
 

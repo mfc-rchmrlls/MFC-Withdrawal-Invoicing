@@ -50,8 +50,9 @@ CREATE TABLE IF NOT EXISTS invoices (
 CREATE TABLE IF NOT EXISTS invoice_items (
  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, invoice_id BIGINT UNSIGNED NOT NULL, withdrawal_item_id BIGINT UNSIGNED NULL, source_type ENUM('WITHDRAWAL','ADDITIONAL') NOT NULL DEFAULT 'WITHDRAWAL',
  product_id BIGINT UNSIGNED NULL, site_id BIGINT UNSIGNED NULL, product_name VARCHAR(255) NOT NULL, quantity BIGINT UNSIGNED NOT NULL,
- lot_number VARCHAR(100) NULL, item_code VARCHAR(100) NULL, description VARCHAR(255) NULL, u_m VARCHAR(40) NULL, price_each DECIMAL(12,2) NOT NULL DEFAULT 0,
- amount DECIMAL(14,2) NOT NULL DEFAULT 0, tax_code VARCHAR(40) NOT NULL DEFAULT 'Non', expiration_date DATE NULL,
+ lot_number VARCHAR(100) NULL, item_code VARCHAR(100) NULL, description VARCHAR(255) NULL, u_m VARCHAR(40) NULL, price_each DECIMAL(12,2) NULL DEFAULT NULL,
+ amount DECIMAL(14,2) NULL DEFAULT NULL, price_source ENUM('mfc_entered','quickbooks_pending','quickbooks_verified','explicit_zero','unresolved') NOT NULL DEFAULT 'unresolved',
+ tax_code VARCHAR(40) NOT NULL DEFAULT 'Non', expiration_date DATE NULL,
  created_by BIGINT UNSIGNED NULL, updated_by BIGINT UNSIGNED NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NULL ON UPDATE CURRENT_TIMESTAMP,
  INDEX idx_invoice_items_invoice(invoice_id), CONSTRAINT fk_ii_invoice FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
  CONSTRAINT fk_ii_wi FOREIGN KEY(withdrawal_item_id) REFERENCES withdrawal_items(id) ON DELETE SET NULL,

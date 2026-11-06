@@ -32,6 +32,15 @@ try {
     if ($reference === '' || !hash_equals($reference, $confirmation)) {
         throw new DomainException('Type the exact saved invoice reference to confirm the QuickBooks submission.');
     }
+    $hasFullNameReferences = is_array($snapshot)
+        && (is_string($snapshot['customer_full_name'] ?? null)
+            || count(array_filter(
+                is_array($snapshot['lines'] ?? null) ? $snapshot['lines'] : [],
+                static fn($line): bool => is_array($line) && is_string($line['item_full_name'] ?? null)
+            )) > 0);
+    if ($hasFullNameReferences && ($_POST['confirm_full_name_references'] ?? null) !== 'yes') {
+        throw new DomainException('Confirm that the exact QuickBooks FullName references are the intended customer and items.');
+    }
 
     $result = qb_export_post(db(), $exportId, (int)$_SESSION['user']['id']);
     if (($result['outcome'] ?? null) === 'succeeded') {

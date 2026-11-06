@@ -78,6 +78,24 @@ function server_test_verify_response(array $response, string $requestId, string 
     return hash_equals($expected, $signature);
 }
 
+function server_test_available_port(): int
+{
+    $socket = @stream_socket_server('tcp://127.0.0.1:0', $errno, $errorMessage);
+    if ($socket === false) {
+        throw new RuntimeException('Could not allocate an isolated loopback test port.');
+    }
+    $address = stream_socket_get_name($socket, false);
+    fclose($socket);
+    if (!is_string($address) || !preg_match('/:(\d+)$/D', $address, $matches)) {
+        throw new RuntimeException('Could not read the isolated loopback test port.');
+    }
+    $port = (int)$matches[1];
+    if ($port < 1024 || $port > 65535 || $port === 8765) {
+        throw new RuntimeException('The isolated loopback test port is invalid or reserved for the live bridge.');
+    }
+    return $port;
+}
+
 if (!function_exists('curl_init') || !function_exists('proc_open')) {
     throw new RuntimeException('This test requires PHP cURL and proc_open.');
 }
@@ -95,6 +113,8 @@ if (!is_string($source)) {
     throw new RuntimeException('The bridge source file is unavailable.');
 }
 $executable = $tempDirectory . DIRECTORY_SEPARATOR . 'QuickBooksReadOnlyBridge.exe';
+$testPort = server_test_available_port();
+$bridgeUrl = 'http://127.0.0.1:' . $testPort;
 $compile = proc_open(
     [$compiler, '/nologo', '/target:exe', '/platform:x64', '/out:' . $executable,
         '/reference:System.Web.Extensions.dll', '/reference:System.Xml.dll',
@@ -124,7 +144,7 @@ putenv('WQ_QB_BRIDGE_SECRET=' . $secret);
 putenv('LOCALAPPDATA=' . $tempDirectory);
 putenv('WQ_QB_INVOICE_WRITE_ENABLED=false');
 $process = proc_open(
-    [$executable],
+    [$executable, '--test-listen-port', (string)$testPort],
     [0 => ['file', 'NUL', 'r'], 1 => ['file', 'NUL', 'w'], 2 => ['file', 'NUL', 'w']],
     $pipes,
     __DIR__,
@@ -150,9 +170,10 @@ if (!is_resource($process)) {
 }
 
 try {
+    server_test_assert($testPort !== 8765, 'compiled bridge server test uses an isolated dynamic port');
     $ready = false;
     for ($attempt = 0; $attempt < 40; $attempt++) {
-        $probe = @stream_socket_client('tcp://127.0.0.1:8765', $errno, $errorMessage, 0.1);
+        $probe = @stream_socket_client('tcp://127.0.0.1:' . $testPort, $errno, $errorMessage, 0.1);
         if ($probe !== false) {
             fclose($probe);
             $ready = true;
@@ -161,24 +182,24 @@ try {
         usleep(50000);
     }
     if (!$ready) {
-        throw new RuntimeException('The compiled bridge did not bind to 127.0.0.1:8765.');
+        throw new RuntimeException('The compiled bridge did not bind to the isolated test port.');
     }
 
-    $client = new QuickBooksBridgeClient('http://127.0.0.1:8765', $secret);
+    $client = new QuickBooksBridgeClient($bridgeUrl, $secret);
     $health = $client->health();
     server_test_assert($health['available'] && $health['response']['sdkRegistered'] === true, 'PHP client validates a live C# bridge health response and HMAC');
 
     $requestId = qb_export_uuid();
     $healthBody = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-    $valid = server_test_request('http://127.0.0.1:8765/health', $healthBody, $requestId, 'health', $secret);
+    $valid = server_test_request($bridgeUrl . '/health', $healthBody, $requestId, 'health', $secret);
     server_test_assert($valid['status'] === 200 && server_test_verify_response($valid, $requestId, $secret), 'bridge success response is authenticated over exact response bytes');
-    $replay = server_test_request('http://127.0.0.1:8765/health', $healthBody, $requestId, 'health', $secret);
+    $replay = server_test_request($bridgeUrl . '/health', $healthBody, $requestId, 'health', $secret);
     server_test_assert($replay['status'] === 409 && server_test_verify_response($replay, $requestId, $secret), 'bridge rejects a replayed nonce and signs the rejection');
 
     $requestId = qb_export_uuid();
     $body = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $invalidSignature = server_test_request(
-        'http://127.0.0.1:8765/health',
+        $bridgeUrl . '/health',
         $body,
         $requestId,
         'health',
@@ -191,7 +212,7 @@ try {
     $requestId = qb_export_uuid();
     $body = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $stale = server_test_request(
-        'http://127.0.0.1:8765/health',
+        $bridgeUrl . '/health',
         $body,
         $requestId,
         'health',
@@ -207,7 +228,7 @@ try {
         'unexpected' => 'not-allowed',
     ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $extraField = server_test_request(
-        'http://127.0.0.1:8765/health',
+        $bridgeUrl . '/health',
         $extraFieldBody,
         $requestId,
         'health',
@@ -221,7 +242,7 @@ try {
         'requestId' => $requestId,
     ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $unknown = server_test_request(
-        'http://127.0.0.1:8765/InvoiceAdd',
+        $bridgeUrl . '/InvoiceAdd',
         $unknownBody,
         $requestId,
         'InvoiceAdd',
@@ -235,6 +256,7 @@ try {
         'requestId' => $requestId,
         'operation' => 'submit',
         'transactionType' => 'invoice',
+        'preparationMode' => 'legacy_mapped',
         'idempotencyKey' => str_repeat('a', 64),
         'source' => ['id' => 1, 'revision' => str_repeat('a', 64)],
         'transaction' => [
@@ -249,6 +271,7 @@ try {
                 'quantity' => '2',
                 'rate' => '10.00',
                 'expectedAmount' => '20.00',
+                'pricingSource' => 'mfc_entered',
                 'salesTaxCode' => ['listId' => 'TAX-LIST-1'],
                 'site' => 'Main Site',
                 'lotNumber' => null,
@@ -261,7 +284,7 @@ try {
         ],
     ], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $submit = server_test_request(
-        'http://127.0.0.1:8765/submit',
+        $bridgeUrl . '/submit',
         $submitBody,
         $requestId,
         'submit',
@@ -281,7 +304,7 @@ try {
     $requestId = qb_export_uuid();
     $body = json_encode(['operation' => 'health', 'requestId' => $requestId], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     $wrongContentType = server_test_request(
-        'http://127.0.0.1:8765/health',
+        $bridgeUrl . '/health',
         $body,
         $requestId,
         'health',
@@ -295,7 +318,7 @@ try {
     $oversizedBody = str_repeat('x', 524289);
     $requestId = qb_export_uuid();
     $oversized = server_test_request(
-        'http://127.0.0.1:8765/health',
+        $bridgeUrl . '/health',
         $oversizedBody,
         $requestId,
         'health',

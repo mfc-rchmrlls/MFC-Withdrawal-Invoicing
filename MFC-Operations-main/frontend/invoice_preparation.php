@@ -48,8 +48,7 @@ if (!$inv) {
     $iid = (int) $pdo->lastInsertId();
 
     $s = $pdo->prepare(
-        'SELECT wi.*, p.qb_code, p.qb_description, p.u_m,
-                p.default_price
+        'SELECT wi.*, p.qb_code, p.qb_description, p.u_m
          FROM withdrawal_items wi
          LEFT JOIN products p ON p.id = wi.product_id
          WHERE wi.withdrawal_id = ?
@@ -63,13 +62,11 @@ if (!$inv) {
         'INSERT INTO invoice_items
          (invoice_id, withdrawal_item_id, source_type, product_id, site_id,
           product_name, quantity, item_code, description, u_m, price_each,
-          amount, created_by, updated_by)
-         VALUES (?, ?, "WITHDRAWAL", ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          amount, price_source, created_by, updated_by)
+         VALUES (?, ?, "WITHDRAWAL", ?, ?, ?, ?, ?, ?, ?, NULL, NULL, "quickbooks_pending", ?, ?)'
     );
 
     foreach ($copy as $it) {
-        $price = (float) ($it['default_price'] ?? 0);
-
         $ins->execute([
             $iid,
             $it['id'],
@@ -80,8 +77,6 @@ if (!$inv) {
             $it['qb_code'],
             $it['qb_description'],
             $it['u_m'],
-            $price,
-            $price * (float) $it['quantity'],
             $_SESSION['user']['id'],
             $_SESSION['user']['id']
         ]);
@@ -111,6 +106,7 @@ $s = $pdo->prepare(
 );
 $s->execute([$inv['id']]);
 $lines = $s->fetchAll();
+$invoiceRevision = invoice_draft_revision($inv, $lines);
 
 $products = get_products($pdo);
 $products = array_values(array_filter($products, static fn($p) => trim((string)($p['qb_code'] ?? '')) !== ''));
@@ -153,6 +149,7 @@ foreach ($lines as $ln) {
     <input type="hidden" name="_csrf" value="<?= e(csrf_token()) ?>">
     <input type="hidden" name="invoice_id" value="<?= (int) $inv['id'] ?>">
     <input type="hidden" name="withdrawal_no" value="<?= e($no) ?>">
+    <input type="hidden" name="invoice_revision" value="<?= e($invoiceRevision) ?>">
 
     <section class="panel">
         <div class="panel-header">
@@ -274,6 +271,15 @@ foreach ($lines as $ln) {
 
                 <tbody>
                     <?php foreach ($lines as $i => $ln): ?>
+                        <?php
+                        $priceSource = (string)($ln['price_source'] ?? 'unresolved');
+                        $hasDisplayedPrice = in_array($priceSource, ['mfc_entered', 'explicit_zero', 'quickbooks_verified'], true)
+                            || ($priceSource === 'unresolved' && $ln['price_each'] !== null && (float)$ln['price_each'] === 0.0);
+                        $hasDisplayedPrice = $hasDisplayedPrice && $ln['price_each'] !== null;
+                        $displayedAmount = $ln['amount'] === null
+                            ? ''
+                            : number_format((float)$ln['amount'], 2, '.', ',');
+                        ?>
                         <tr>
                             <td>
                                 <select class="form-select table-input" name="items[<?= $i ?>][site_id]" required <?= $locked ? 'disabled' : '' ?>>
@@ -323,7 +329,7 @@ foreach ($lines as $ln) {
 
                             <td>
                                 <div class="d-flex gap-1 invoice-description-picker"><select class="form-select table-input product-select" name="items[<?= $i ?>][product_id]" required aria-label="Product description" <?= $locked ? 'disabled' : '' ?>>
-                                        <option value="">Select description</option><?php foreach ($products as $pr): ?><option value="<?= (int)$pr['id'] ?>" data-code="<?= e($pr['qb_code'] ?? '') ?>" data-desc="<?= e($pr['qb_description'] ?? '') ?>" data-name="<?= e($pr['product_name'] ?? '') ?>" data-um="<?= e($pr['u_m'] ?? '') ?>" data-price="<?= e($pr['default_price'] ?? '') ?>" <?= (int)$ln['product_id'] === (int)$pr['id'] ? 'selected' : '' ?>><?= e($pr['qb_description'] ?? '') ?></option><?php endforeach; ?>
+                                        <option value="">Select description</option><?php foreach ($products as $pr): ?>                                        <option value="<?= (int)$pr['id'] ?>" data-code="<?= e($pr['qb_code'] ?? '') ?>" data-desc="<?= e($pr['qb_description'] ?? '') ?>" data-name="<?= e($pr['product_name'] ?? '') ?>" data-um="<?= e($pr['u_m'] ?? '') ?>" <?= (int)$ln['product_id'] === (int)$pr['id'] ? 'selected' : '' ?>><?= e($pr['qb_description'] ?? '') ?></option><?php endforeach; ?>
                                     </select><?php if (!$locked): ?><button type="button" class="btn btn-sm btn-outline-danger remove-invoice-line" title="Remove line" aria-label="Remove invoice line">×</button><?php endif; ?></div><input type="hidden" name="items[<?= $i ?>][description]" value="<?= e($ln['description'] ?? '') ?>"><input type="hidden" name="items[<?= $i ?>][product_name]" value="<?= e($ln['product_name']) ?>">
                             </td>
 
@@ -341,15 +347,33 @@ foreach ($lines as $ln) {
                                     type="text"
                                     inputmode="decimal"
                                     name="items[<?= $i ?>][price_each]"
-                                    value="<?= number_format((float) $ln['price_each'], 2, '.', ',') ?>"
-                                    required
+                                    value="<?= $hasDisplayedPrice ? number_format((float)$ln['price_each'], 2, '.', ',') : '' ?>"
+                                    placeholder="Enter unit price"
                                     <?= $locked ? 'readonly' : '' ?>>
+                                <small class="d-block text-muted invoice-price-status">
+                                    <?php if ($priceSource === 'mfc_entered'): ?>MFC-entered
+                                    <?php elseif ($priceSource === 'explicit_zero'): ?>Explicit zero — valid
+                                    <?php elseif ($priceSource === 'quickbooks_verified'): ?>QuickBooks price — review required
+                                    <?php elseif ($priceSource === 'unresolved' && $ln['price_each'] !== null): ?>
+                                        Historical price <?= number_format((float)$ln['price_each'], 2, '.', ',') ?> is unresolved; confirm its existing value
+                                    <?php else: ?>Enter a Unit Price; blank prices cannot be saved for export<?php endif; ?>
+                                </small>
+                                <?php if ($priceSource === 'unresolved' && $ln['price_each'] !== null && !$locked): ?>
+                                    <?php if (($_SESSION['user']['role'] ?? '') === 'Admin'): ?>
+                                        <div class="form-check mt-1">
+                                            <input class="form-check-input" type="checkbox" id="confirm-historical-price-<?= (int)$ln['id'] ?>" name="items[<?= $i ?>][confirm_historical_price]" value="yes">
+                                            <label class="form-check-label small" for="confirm-historical-price-<?= (int)$ln['id'] ?>"><?= (float)$ln['price_each'] === 0.0 ? 'Admin confirms this stored zero price' : 'Admin confirms re-entered price' ?></label>
+                                        </div>
+                                    <?php else: ?>
+                                        <small class="d-block text-warning">An Admin must confirm this historical price.</small>
+                                    <?php endif; ?>
+                                <?php endif; ?>
                             </td>
 
                             <td>
                                 <input
                                     class="form-control table-input amount"
-                                    value="<?= number_format((float) $ln['quantity'] * (float) $ln['price_each'], 2, '.', ',') ?>"
+                                    value="<?= $hasDisplayedPrice ? number_format((float)$ln['quantity'] * (float)$ln['price_each'], 2, '.', ',') : e($displayedAmount) ?>"
                                     readonly>
                             </td>
 
@@ -436,7 +460,7 @@ foreach ($lines as $ln) {
                 else if (el.name.endsWith('[tax_code]')) el.value = 'Non';
                 else if (el.type === 'hidden' || el.name.endsWith('[lot_number]') || el.name.endsWith('[item_code]') || el.name.endsWith('[description]') || el.name.endsWith('[u_m]') || el.name.endsWith('[expiration_date]')) el.value = '';
                 else if (el.name.endsWith('[quantity]')) el.value = '1';
-                else if (el.name.endsWith('[price_each]')) el.value = '0.00';
+                else if (el.name.endsWith('[price_each]')) el.value = '';
             });
             row.querySelector("input[name$='[source_type]']").value = 'ADDITIONAL';
             tbody.appendChild(row);
@@ -454,17 +478,46 @@ foreach ($lines as $ln) {
             row.querySelector("input[name$='[description]']").value = opt.dataset.desc || '';
             row.querySelector("input[name$='[product_name]']").value = opt.dataset.name || '';
             row.querySelector("input[name$='[u_m]']").value = opt.dataset.um || '';
-            const price = row.querySelector('.invoice-price');
-            if (!price.value || window.parseMoneyValue(price.value) === 0) price.value = window.formatMoneyValue(opt.dataset.price || 0);
             updateAmount(row);
         });
 
         function updateAmount(row) {
-            row.querySelector('.amount').value = window.formatMoneyValue(Number(row.querySelector('.invoice-qty').value || 0) * window.parseMoneyValue(row.querySelector('.invoice-price').value || 0));
-            document.querySelector('[data-invoice-total]').textContent = [...tbody.querySelectorAll('.amount')].reduce((sum, input) => sum + window.parseMoneyValue(input.value), 0).toLocaleString('en-PH', {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2
-            });
+            const priceInput = row.querySelector('.invoice-price');
+            const priceRaw = priceInput.value.trim();
+            const status = row.querySelector('.invoice-price-status');
+            if (priceRaw === '') {
+                row.querySelector('.amount').value = '';
+                status.textContent = 'Price required; QuickBooks fallback has not been verified';
+            } else {
+                const rateCents = parseCents(priceRaw);
+                const quantityRaw = row.querySelector('.invoice-qty').value;
+                const quantity = /^\d{1,9}$/.test(quantityRaw) ? Number(quantityRaw) : 0;
+                const amountCents = rateCents === null || quantity < 1 ? null : rateCents * quantity;
+                row.querySelector('.amount').value = Number.isSafeInteger(amountCents)
+                    ? formatCents(amountCents)
+                    : '';
+                status.textContent = rateCents === null
+                    ? 'Enter a valid price with up to two decimals'
+                    : rateCents === 0 ? 'Explicit zero — approval required' : 'MFC-entered';
+            }
+            const totalCents = [...tbody.querySelectorAll('.amount')].reduce((sum, input) => {
+                const cents = parseCents(input.value);
+                return cents === null ? sum : sum + cents;
+            }, 0);
+            document.querySelector('[data-invoice-total]').textContent = formatCents(totalCents);
+        }
+
+        function parseCents(value) {
+            const normalized = value.trim().replace(/,/g, '');
+            if (!/^\d{1,10}(?:\.\d{1,2})?$/.test(normalized)) return null;
+            const [whole, fraction = ''] = normalized.split('.');
+            return Number(whole) * 100 + Number((fraction + '00').slice(0, 2));
+        }
+
+        function formatCents(cents) {
+            if (!Number.isSafeInteger(cents) || cents < 0) return '';
+            const whole = String(Math.floor(cents / 100)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+            return whole + '.' + String(cents % 100).padStart(2, '0');
         }
         tbody.addEventListener('input', event => {
             if (event.target.matches('.invoice-qty,.invoice-price')) updateAmount(event.target.closest('tr'));

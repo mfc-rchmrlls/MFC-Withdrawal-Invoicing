@@ -1,7 +1,7 @@
 <?php
 
 declare(strict_types=1);
-$page_title = 'QuickBooks Export Preview';
+$page_title = 'QuickBooks Export Previews';
 require_once __DIR__ . '/../backend/config/app.php';
 require_once __DIR__ . '/../backend/core/quickbooks_exports.php';
 require_once __DIR__ . '/../backend/core/quickbooks_bridge_client.php';
@@ -53,9 +53,15 @@ unset($_SESSION['_qb_company_diagnostic']);
 $lastCompanyIdentityDiagnostic = is_array($_SESSION['_qb_company_last_success'] ?? null)
     ? $_SESSION['_qb_company_last_success']
     : null;
+$referencePreflightDiagnostic = is_array($_SESSION['_qb_reference_preflight'] ?? null)
+    ? $_SESSION['_qb_reference_preflight']
+    : null;
+unset($_SESSION['_qb_reference_preflight']);
 
 $invoices = $pdo->query(
-    'SELECT i.id, i.invoice_number AS reference_number, i.status, w.withdrawal_no, c.client_name
+    'SELECT i.id, i.invoice_number AS reference_number, i.invoice_date AS transaction_date,
+            (SELECT COALESCE(SUM(ii.amount), 0) FROM invoice_items ii WHERE ii.invoice_id=i.id) AS line_subtotal,
+            i.status, w.withdrawal_no, c.client_name
      FROM invoices i JOIN withdrawals w ON w.id=i.withdrawal_id
      JOIN clients c ON c.id=i.customer_id
      ORDER BY i.id DESC LIMIT 100'
@@ -68,7 +74,9 @@ $localTaxChoices = $pdo->query(
 $orders = [];
 try {
     $orders = $pdo->query(
-        'SELECT so.id, so.so_number AS reference_number, so.status, w.withdrawal_no, c.client_name
+        'SELECT so.id, so.so_number AS reference_number, so.sales_order_date AS transaction_date,
+                (SELECT COALESCE(SUM(soi.amount), 0) FROM sales_order_items soi WHERE soi.sales_order_id=so.id) AS line_subtotal,
+                so.status, w.withdrawal_no, c.client_name
          FROM sales_orders so JOIN withdrawals w ON w.id=so.withdrawal_id
          JOIN clients c ON c.id=so.customer_id
          ORDER BY so.id DESC LIMIT 100'
@@ -76,6 +84,21 @@ try {
 } catch (PDOException) {
     $loadError = 'Sales-order tables are unavailable. Apply the sales-order preparation migration before using sales-order previews.';
 }
+$availableTransactions = [];
+foreach ($invoices as $item) {
+    $item['transaction_type'] = 'invoice';
+    $item['type_label'] = 'Invoice';
+    $availableTransactions[] = $item;
+}
+foreach ($orders as $item) {
+    $item['transaction_type'] = 'sales_order';
+    $item['type_label'] = 'Sales Order';
+    $availableTransactions[] = $item;
+}
+usort($availableTransactions, static function (array $left, array $right): int {
+    $dateOrder = strcmp((string)$right['transaction_date'], (string)$left['transaction_date']);
+    return $dateOrder !== 0 ? $dateOrder : ((int)$right['id'] <=> (int)$left['id']);
+});
 
 if ($sourceId && in_array($type, qb_export_types(), true)) {
     try {
@@ -139,6 +162,10 @@ if (is_array($selectedExport)) {
 $referenceLookup = is_array($_SESSION['_qb_reference_lookup'] ?? null)
     ? $_SESSION['_qb_reference_lookup']
     : null;
+$referenceScan = is_array($_SESSION['_qb_reference_scan'] ?? null)
+    ? $_SESSION['_qb_reference_scan']
+    : null;
+unset($_SESSION['_qb_reference_scan']);
 $referenceCandidateSummary = null;
 $referenceMatchingListIds = [];
 if (is_array($referenceLookup)) {
@@ -164,24 +191,89 @@ try {
 }
 require __DIR__ . '/includes/layout_start.php';
 ?>
-<div class="page-intro">
+<div class="qb-export-page">
+<?php
+$verifiedCompanyIdentity = $companyDiagnostic['company_identity']
+    ?? $lastCompanyIdentityDiagnostic['company_identity']
+    ?? null;
+$companyVerificationStatus = !empty($companyDiagnostic['company_identity_verified'])
+    ? 'Verified in latest check'
+    : (!empty($lastCompanyIdentityDiagnostic['checked_at']) ? 'Previously verified' : 'Not verified');
+$bridgeWriteEnabled = ($bridgeHealth['invoiceWriteEnabled'] ?? null) === true;
+$invoiceSendingStatus = !$quickBooksConfiguration['php_write_enabled'] || !$bridgeWriteEnabled
+    ? 'Disabled by configuration'
+    : (!$bridge['available'] || !is_array($verifiedCompanyIdentity)
+        ? 'Not ready'
+        : 'Requires invoice preflight');
+?>
+<div class="page-intro qb-export-intro">
     <div>
-        <!-- <h2>QuickBooks Export Preview</h2> -->
-        <p>Admin-only invoice review and posting. QuickBooks writes remain disabled until an authorized live setup is complete.</p>
+        <h2>QuickBooks Export Previews</h2>
+        <p>Review and validate transactions before export.</p>
     </div>
-    <span class="status-pill <?= $bridge['available'] ? 'status-success' : 'status-muted' ?>">
-        <?= $bridge['available'] ? 'Local bridge responding' : 'Local bridge unavailable' ?>
-    </span>
 </div>
-<?php if (!$bridge['available']): ?>
-    <div class="alert alert-warning" role="status">
-        <strong>Bridge connection not verified:</strong>
-        <?= e((string)($bridge['message'] ?? 'No authenticated response was received.')) ?>
-        <?php if (!empty($bridge['diagnostic_code'])): ?><code><?= e((string)$bridge['diagnostic_code']) ?></code><?php endif; ?>
-        No QuickBooks company session or accounting write has been attempted by this page load.
+<section class="panel qb-connection-summary mb-4" aria-labelledby="qb-connection-heading">
+    <div class="panel-header">
+        <h3 id="qb-connection-heading">QuickBooks connection</h3>
+        <a class="btn btn-sm btn-outline-secondary" href="#advanced-diagnostics">Advanced Diagnostics</a>
     </div>
+    <div class="panel-body qb-connection-grid">
+        <div>
+            <span class="qb-summary-label">Bridge</span>
+            <span class="status-pill <?= $bridge['available'] ? 'status-success' : 'status-danger' ?>">
+                <?= $bridge['available'] ? 'Connected' : 'Unavailable' ?>
+            </span>
+        </div>
+        <div>
+            <span class="qb-summary-label">Company (last verified)</span>
+            <strong><?= e(is_array($verifiedCompanyIdentity) ? (string)($verifiedCompanyIdentity['companyName'] ?? 'Unknown') : 'Not verified') ?></strong>
+        </div>
+        <div>
+            <span class="qb-summary-label">Company verification</span>
+            <strong><?= e($companyVerificationStatus) ?></strong>
+        </div>
+        <div>
+            <span class="qb-summary-label">Invoice sending</span>
+            <strong><?= e($invoiceSendingStatus) ?></strong>
+        </div>
+    </div>
+</section>
+<details class="qb-advanced-diagnostics mb-4" id="advanced-diagnostics">
+    <summary>Advanced Diagnostics</summary>
+<?php if ($referencePreflightDiagnostic !== null): ?>
+    <section class="panel mb-4" aria-labelledby="reference-preflight-diagnostic-heading">
+        <div class="panel-header">
+            <div>
+                <h3 id="reference-preflight-diagnostic-heading">Latest invoice reference preflight</h3>
+                <p>Read-only company-bound results. A failed query is not evidence that a customer, item, or Site is missing.</p>
+            </div>
+        </div>
+        <div class="panel-body">
+            <p class="small text-muted">Checked <?= e((string)($referencePreflightDiagnostic['checked_at'] ?? '')) ?>. No invoice was queued or sent by this failed preflight.</p>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th>Reference</th><th>Result</th><th>Diagnostic</th></tr></thead>
+                    <tbody>
+                    <?php foreach (($referencePreflightDiagnostic['errors'] ?? []) as $error): ?>
+                        <?php if (!is_array($error)) { continue; } ?>
+                        <tr>
+                            <td><?= e(trim((string)($error['entity'] ?? '') . ' ' . (string)($error['reference'] ?? ''))) ?: 'Company settings' ?></td>
+                            <td><?= e((string)($error['message'] ?? 'Preflight requirement was not satisfied.')) ?></td>
+                            <td>
+                                <?php if (!empty($error['diagnostic_code'])): ?><code><?= e((string)$error['diagnostic_code']) ?></code><?php endif; ?>
+                                <?php if (!empty($error['failure_stage'])): ?> <span>Stage:</span> <code><?= e((string)$error['failure_stage']) ?></code><?php endif; ?>
+                                <?php if (!empty($error['sdk_error_code'])): ?> <span>SDK:</span> <code><?= e((string)$error['sdk_error_code']) ?></code><?php endif; ?>
+                                <?php if (!empty($error['request_id'])): ?><small class="d-block">Request: <?= e((string)$error['request_id']) ?></small><?php endif; ?>
+                                <span class="text-muted"><?= e((string)($error['code'] ?? '')) ?></span>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
 <?php endif; ?>
-<div class="notice warning"><strong>Protected posting:</strong> the invoice posting path is implemented, but actual writes remain disabled unless PHP and the local bridge are explicitly enabled and all company-bound reference checks pass. Sales-order posting remains unavailable. No preview or diagnostic operation creates a QuickBooks transaction.</div>
 <section class="panel mb-4" id="reference-verification">
     <div class="panel-header">
         <div>
@@ -190,11 +282,129 @@ require __DIR__ . '/includes/layout_start.php';
         </div>
     </div>
     <div class="panel-body">
+        <section class="border rounded p-3 mb-4" id="reference-scan" aria-labelledby="reference-scan-heading">
+            <h4 id="reference-scan-heading">QuickBooks reference discovery</h4>
+            <p>Run a signed, read-only scan of the verified company. Customer and item lists use bounded pagination (up to 100 records each); sites, mapped item units, and saved tax-code ListIDs are checked only against local known references. Broad item results omit SalesDesc and pricing; use the existing exact item lookup for that detail. Results are advisory and never approve mappings.</p>
+            <form method="post" action="<?= e(APP_BASE_URL) ?>/backend/controllers/qb_reference_scan.php">
+                <input type="hidden" name="_csrf" value="<?= e(csrf_token()) ?>">
+                <label class="form-check mb-3">
+                    <input class="form-check-input" type="checkbox" name="confirm_company" value="Testing QB.qbw" required>
+                    <span class="form-check-label">I confirm that <strong>Testing QB.qbw</strong> is currently open in QuickBooks.</span>
+                </label>
+                <button class="btn btn-outline-primary" type="submit" <?= $referenceLoadError !== '' ? 'disabled' : '' ?>>Scan QuickBooks References</button>
+            </form>
+            <?php if ($referenceScan): ?>
+                <div class="mt-3" role="status" aria-live="polite">
+                    <?php if (empty($referenceScan['available'])): ?>
+                        <div class="alert alert-warning mb-2">
+                            <?= e((string)($referenceScan['message'] ?? 'The scan was unavailable.')) ?>
+                            <?php if (!empty($referenceScan['diagnostic_code'])): ?><code><?= e((string)$referenceScan['diagnostic_code']) ?></code><?php endif; ?>
+                            <?php if (!empty($referenceScan['failure_stage'])): ?>Stage: <code><?= e((string)$referenceScan['failure_stage']) ?></code><?php endif; ?>
+                        </div>
+                    <?php else: ?>
+                        <p><strong>Company:</strong> <?= e((string)($referenceScan['company_identity']['companyName'] ?? 'Unknown')) ?>
+                            <span class="text-muted">(identity checked against configured fingerprint)</span>
+                        </p>
+                        <p class="small text-muted">Request ID: <?= e((string)($referenceScan['request_id'] ?? '')) ?>. No QuickBooks records or local mappings were changed.</p>
+                        <?php foreach ([
+                            'local_customer_limit_reached' => 'Local customer results are limited to 100.',
+                            'local_product_limit_reached' => 'Local product results are limited to 100.',
+                            'local_site_limit_reached' => 'Only the first 20 local sites were checked.',
+                            'saved_item_list_limit_reached' => 'Only the first 20 saved item ListIDs were checked for units of measure.',
+                            'saved_tax_code_limit_reached' => 'Only the first 20 saved tax-code ListIDs were checked.',
+                            'local_tax_code_limit_reached' => 'Only the first 20 local tax codes were reviewed.',
+                        ] as $limitFlag => $limitMessage): ?>
+                            <?php if (!empty($referenceScan[$limitFlag])): ?><p class="alert alert-warning py-2"><?= e($limitMessage) ?></p><?php endif; ?>
+                        <?php endforeach; ?>
+                        <div class="table-responsive">
+                            <table class="table table-sm align-middle">
+                                <thead><tr><th>Reference group</th><th>Scope</th><th>Status</th><th>Results</th></tr></thead>
+                                <tbody>
+                                <?php foreach ($referenceScan['categories'] as $category): ?>
+                                    <tr>
+                                        <td><?= e(str_replace('_', ' ', (string)$category['category'])) ?></td>
+                                        <td><?= e(str_replace('_', ' ', (string)$category['scope'])) ?></td>
+                                        <td><span class="status-pill <?= $category['status'] === 'complete' ? 'status-success' : ($category['status'] === 'partial' ? 'status-warning' : 'status-danger') ?>"><?= e((string)$category['status']) ?></span>
+                                            <?php if (!empty($category['diagnosticCode'])): ?><code><?= e((string)$category['diagnosticCode']) ?></code><?php endif; ?>
+                                        </td>
+                                        <td><?= (int)$category['recordCount'] ?> / <?= (int)$category['limit'] ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                        <details class="mt-3">
+                            <summary>Local reference mapping review</summary>
+                            <div class="table-responsive mt-2">
+                                <table class="table table-sm align-middle">
+                                    <thead><tr><th>Type</th><th>Local reference</th><th>Result</th><th>QuickBooks candidates</th></tr></thead>
+                                    <tbody>
+                                    <?php foreach ($referenceScan['matches'] as $match): ?>
+                                        <tr>
+                                            <td><?= e((string)$match['type']) ?></td>
+                                            <td><?= e((string)$match['local_name']) ?></td>
+                                            <td><?= e(str_replace('_', ' ', (string)$match['status'])) ?></td>
+                                            <td>
+                                                <?php if (!$match['candidates']): ?>None found in scanned results
+                                                <?php else: foreach ($match['candidates'] as $candidate): ?>
+                                                    <div><strong><?= e((string)($candidate['fullName'] ?? $candidate['itemName'] ?? $candidate['name'] ?? $candidate['unitSetName'] ?? '')) ?></strong>
+                                                        <code><?= e((string)$candidate['listId']) ?></code>
+                                                        <?php if (isset($candidate['active'])): ?><?= $candidate['active'] ? 'Active' : 'Inactive' ?><?php endif; ?>
+                                                        <?php if (!empty($candidate['companyName'])): ?> · <?= e((string)$candidate['companyName']) ?><?php endif; ?>
+                                                        <?php if (!empty($candidate['manufacturerPartNumber'])): ?> · MPN <?= e((string)$candidate['manufacturerPartNumber']) ?><?php endif; ?>
+                                                        <?php if (!empty($candidate['unitSetName'])): ?> · U/M set <?= e((string)$candidate['unitSetName']) ?><?php endif; ?>
+                                                        <?php if (!empty($candidate['units'])): ?> · Units <?= e(implode(', ', array_column($candidate['units'], 'name'))) ?><?php endif; ?>
+                                                    </div>
+                                                <?php endforeach; endif; ?>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <p class="small text-muted">Exact names and active status are discovery evidence only. Resolve each candidate through the existing Admin lookup and signed verification workflow before invoice preflight.</p>
+                        </details>
+                        <details class="mt-3">
+                            <summary>Read-only reference details</summary>
+                            <?php foreach ($referenceScan['categories'] as $category): ?>
+                                <h5 class="mt-3"><?= e(str_replace('_', ' ', (string)$category['category'])) ?></h5>
+                                <?php if ($category['records']): ?>
+                                    <ul class="small mb-2">
+                                    <?php foreach ($category['records'] as $record): ?>
+                                        <li>
+                                            <?php if ($category['category'] === 'company_preferences'): ?>
+                                                <?php foreach ($record as $preference => $value): ?>
+                                                    <span><strong><?= e(str_replace('_', ' ', (string)$preference)) ?>:</strong>
+                                                        <?= e(is_array($value)
+                                                            ? trim((string)($value['fullName'] ?? '') . (!empty($value['listId']) ? ' [' . $value['listId'] . ']' : ''))
+                                                            : (is_bool($value) ? ($value ? 'Yes' : 'No') : (string)($value ?? 'Unknown'))) ?></span>
+                                                <?php endforeach; ?>
+                                            <?php else: ?>
+                                                <?php if (isset($record['listId'])): ?><code><?= e((string)$record['listId']) ?></code><?php endif; ?>
+                                                <?= e((string)($record['fullName'] ?? $record['name'] ?? $record['itemName'] ?? $record['unitSetName'] ?? '')) ?>
+                                                <?php if (isset($record['active'])): ?><?= $record['active'] ? ' — Active' : ' — Inactive' ?><?php endif; ?>
+                                                <?php if (!empty($record['companyName'])): ?> — Company: <?= e((string)$record['companyName']) ?><?php endif; ?>
+                                                <?php if (!empty($record['customerType'])): ?> — Type: <?= e((string)$record['customerType']) ?><?php endif; ?>
+                                                <?php if (!empty($record['itemType'])): ?> — Type: <?= e((string)$record['itemType']) ?><?php endif; ?>
+                                                <?php if (!empty($record['manufacturerPartNumber'])): ?> — MPN: <?= e((string)$record['manufacturerPartNumber']) ?><?php endif; ?>
+                                                <?php if (!empty($record['unitSetName'])): ?> — U/M set: <?= e((string)$record['unitSetName']) ?><?php endif; ?>
+                                                <?php if (!empty($record['units'])): ?> — U/M: <?= e(implode(', ', array_column($record['units'], 'name'))) ?><?php endif; ?>
+                                            <?php endif; ?>
+                                        </li>
+                                    <?php endforeach; ?>
+                                    </ul>
+                                <?php else: ?><p class="small text-muted">No records returned for this scope.</p><?php endif; ?>
+                            <?php endforeach; ?>
+                        </details>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
+        </section>
         <?php if ($referenceLoadError !== ''): ?><div class="alert alert-danger" role="alert"><?= e($referenceLoadError) ?></div><?php endif; ?>
         <div class="alert alert-warning" role="status">
             Customer lookup runs separate bounded exact queries for QuickBooks <code>Name</code> and <code>FullName</code>; returned <code>CompanyName</code> is shown separately for review, but QuickBooks provides no CompanyName query filter.
             Product lookup runs bounded exact <code>Name</code>/<code>FullName</code> searches using the local product name and configured invoice description. An Admin may explicitly select a candidate after reviewing its QuickBooks identity and confirming that it is the intended product. This approval creates a direct local-product-to-QuickBooks-ListID mapping; it does not claim that the local Item Code matches any QuickBooks field. QBXML 16.0 does not expose a generic SKU field or SKU filter; <code>ManufacturerPartNumber</code> is not assumed to be the Item Code. <code>SalesDesc</code> is shown separately and is not treated as an invoice-line <code>Desc</code>.
-            No unrestricted customer or item lists are enumerated. The exact active ListID and company identity are rechecked before mapping evidence is saved.
+            The reference scan can enumerate customer and item lists through capped read-only iterators; it reports capped results as partial. The existing mapping workflow still rechecks the exact active ListID and company identity before saving signed approval evidence.
         </div>
         <div class="alert alert-info" role="note">
             Business confirmation and technical verification are separate. Customer matches must be unique and active. For products, an Admin must manually select and confirm the exact intended QuickBooks item; duplicate candidates are not auto-selected. Item Code remains local-only and is not sent by InvoiceAdd.
@@ -570,6 +780,12 @@ require __DIR__ . '/includes/layout_start.php';
                 <?php if (!empty($companyDiagnostic['diagnostic_code'])): ?>
                     <code><?= e((string)$companyDiagnostic['diagnostic_code']) ?></code>
                 <?php endif; ?>
+                <?php if (!empty($companyDiagnostic['failure_stage'])): ?>
+                    <small class="d-block">Failure stage: <code><?= e((string)$companyDiagnostic['failure_stage']) ?></code></small>
+                <?php endif; ?>
+                <?php if (!empty($companyDiagnostic['sdk_error_code'])): ?>
+                    <small class="d-block">Sanitized SDK code: <code><?= e((string)$companyDiagnostic['sdk_error_code']) ?></code></small>
+                <?php endif; ?>
                 <?php if (!empty($companyDiagnostic['request_id'])): ?>
                     <small class="d-block">Request ID: <code><?= e((string)$companyDiagnostic['request_id']) ?></code></small>
                 <?php endif; ?>
@@ -591,135 +807,153 @@ require __DIR__ . '/includes/layout_start.php';
         <?php endif; ?>
     </div>
 </section>
+    <div class="small text-muted px-3 pb-3">
+        Read-only diagnostics and reference approval only. Posting remains subject to the selected invoice's protected server-side preflight and confirmation.
+    </div>
+</details>
 <?php if ($loadError !== ''): ?><div class="alert alert-danger" role="alert"><?= e($loadError) ?></div><?php endif; ?>
-<?php if (!$bridge['available']): ?><div class="alert alert-secondary" role="status"><?= e($bridge['message']) ?> (<?= e($bridge['diagnostic_code']) ?>)</div><?php endif; ?>
-<?php if ($bridge['available']): ?><div class="alert alert-info" role="status">
-        Bridge HTTP: responding;
-        SDK registration: <?= !empty($bridgeHealth['sdkRegistered']) ? 'available' : 'unavailable' ?>;
-        QuickBooks process: <?= !empty($bridgeHealth['quickBooksProcessRunning']) ? 'running' : 'not detected' ?>;
-        company session: not checked by health status.
-    </div><?php endif; ?>
-<section class="panel mb-4">
+<section class="panel mb-4" id="export-transactions">
     <div class="panel-header">
         <div>
-            <h3>Select a prepared transaction</h3>
-            <p>Invoices and sales orders are listed separately.</p>
+            <h3>Export Transactions</h3>
+            <p><?= count($availableTransactions) ?> available transaction(s)</p>
         </div>
     </div>
-    <div class="panel-body row g-4">
-        <div class="col-lg-6">
-            <h4>Invoices</h4>
-            <div class="table-responsive">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>Invoice</th>
-                            <th>Withdrawal</th>
-                            <th>Customer</th>
-                            <th>Status</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody><?php if (!$invoices): ?><tr>
-                                <td colspan="5">No invoice drafts.</td>
-                            </tr><?php endif; ?>
-                        <?php foreach ($invoices as $item): ?><tr>
-                                <td><?= e($item['reference_number'] ?: '(unnumbered)') ?></td>
-                                <td><?= e($item['withdrawal_no']) ?></td>
-                                <td><?= e($item['client_name']) ?></td>
-                                <td><?= e($item['status']) ?></td>
-                                <td><a class="btn btn-sm btn-outline-primary" href="?type=invoice&amp;id=<?= (int)$item['id'] ?>">Preview</a></td>
-                            </tr><?php endforeach; ?></tbody>
-                </table>
-            </div>
-        </div>
-        <div class="col-lg-6">
-            <h4>Sales Orders</h4>
-            <div class="table-responsive">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>S.O. No.</th>
-                            <th>Withdrawal</th>
-                            <th>Customer</th>
-                            <th>Status</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody><?php if (!$orders): ?><tr>
-                                <td colspan="5">No sales-order drafts. Confirm the sales-order migration is applied.</td>
-                            </tr><?php endif; ?>
-                        <?php foreach ($orders as $item): ?><tr>
-                                <td><?= e($item['reference_number'] ?: '(unnumbered)') ?></td>
-                                <td><?= e($item['withdrawal_no']) ?></td>
-                                <td><?= e($item['client_name']) ?></td>
-                                <td><?= e($item['status']) ?></td>
-                                <td><a class="btn btn-sm btn-outline-primary" href="?type=sales_order&amp;id=<?= (int)$item['id'] ?>">Preview</a></td>
-                            </tr><?php endforeach; ?></tbody>
-                </table>
-            </div>
-        </div>
+    <div class="table-responsive">
+        <table class="table table-sm align-middle">
+            <thead>
+                <tr>
+                    <th scope="col">Reference Number</th>
+                    <th scope="col">Transaction Type</th>
+                    <th scope="col">Customer</th>
+                    <th scope="col">Date</th>
+                    <th scope="col">Line Subtotal</th>
+                    <th scope="col">Status</th>
+                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (!$availableTransactions): ?>
+                    <tr><td colspan="7" class="text-muted">No prepared transactions are available.</td></tr>
+                <?php endif; ?>
+                <?php foreach ($availableTransactions as $item): ?>
+                    <tr>
+                        <td><?= e($item['reference_number'] ?: '(unnumbered)') ?></td>
+                        <td><?= e($item['type_label']) ?></td>
+                        <td><?= e($item['client_name']) ?></td>
+                        <td><?= e($item['transaction_date']) ?></td>
+                        <td><?= e((string)$item['line_subtotal']) ?></td>
+                        <td><?= e($item['status']) ?></td>
+                        <td><a class="btn btn-sm btn-outline-primary" href="?type=<?= e($item['transaction_type']) ?>&amp;id=<?= (int)$item['id'] ?>#transaction-preview">Review</a></td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
     </div>
 </section>
 <?php if ($preview): $transaction = $preview['transaction']; ?>
-    <section class="panel mb-4">
+    <section class="panel mb-4" id="transaction-preview">
         <div class="panel-header">
             <div>
-                <h3><?= $type === 'invoice' ? 'Invoice' : 'Sales Order' ?> preview</h3>
-                <p>Source #<?= (int)$sourceId ?>; revision <?= e(substr((string)$preview['source_revision'], 0, 16)) ?>…</p>
+                <h3>Transaction Preview</h3>
+                <p><?= $type === 'invoice' ? 'Invoice' : 'Sales Order' ?> <?= e($transaction['reference_number'] ?: '(unnumbered)') ?></p>
             </div>
-            <span class="status-pill <?= $preview['valid'] ? 'status-success' : 'status-danger' ?>"><?= $preview['valid'] ? 'PHP validation passed' : count($preview['errors']) . ' blocking issue(s)' ?></span>
+            <span class="status-pill <?= $preview['valid'] ? 'status-success' : 'status-danger' ?>">
+                <?= $preview['valid'] ? 'Validation passed' : count($preview['errors']) . ' issue(s) to resolve' ?>
+            </span>
         </div>
         <div class="panel-body">
             <?php if ($transaction): ?>
-                <dl class="row">
-                    <dt class="col-sm-3">Customer</dt>
-                    <dd class="col-sm-9"><?= e($transaction['customer']) ?> — <?= e($transaction['customer_mapping_status']) ?><?= $transaction['customer_list_id'] ? ' (' . e($transaction['customer_list_id']) . ')' : '' ?></dd>
-                    <dt class="col-sm-3">Date</dt>
-                    <dd class="col-sm-9"><?= e($transaction['transaction_date']) ?></dd>
-                    <dt class="col-sm-3">Local reference</dt>
-                    <dd class="col-sm-9"><?= e($transaction['reference_number']) ?></dd>
-                    <dt class="col-sm-3">P.O. number</dt>
-                    <dd class="col-sm-9"><?= e($transaction['po_number'] ?? '—') ?></dd>
-                    <dt class="col-sm-3">Memo</dt>
-                    <dd class="col-sm-9"><?= e($transaction['memo'] ?? '—') ?></dd>
-                    <dt class="col-sm-3">Expected line subtotal</dt>
-                    <dd class="col-sm-9"><?= e($transaction['expected_subtotal']) ?></dd>
-                    <dt class="col-sm-3">Tax / expected total</dt>
-                    <dd class="col-sm-9"><?= e($transaction['tax_total_status']) ?><?= $type === 'sales_order' ? '; total unresolved' : '' ?></dd>
+                <?php if (($transaction['preparation_mode'] ?? null) === 'quickbooks_managed_defaults'): ?>
+                    <div class="alert alert-info py-2" role="status">
+                        QuickBooks-managed defaults mode: tax references are omitted, but live tax behavior is unverified.
+                        Unit defaults are used only when the item has no unit set; configured unit sets require an exact sales-unit match.
+                        Prices shown are local invoice values; zero prices are blocked until explicitly approved.
+                        Inventory Site must resolve to the exact active QuickBooks FullName.
+                    </div>
+                <?php endif; ?>
+                <dl class="row qb-transaction-meta">
+                    <dt class="col-sm-3 col-lg-2">Customer</dt>
+                    <dd class="col-sm-9 col-lg-4">
+                        <?= e($transaction['customer']) ?>
+                        <?php if (!empty($transaction['customer_full_name'])): ?>
+                            <span class="text-muted">— QuickBooks FullName candidate: <?= e($transaction['customer_full_name']) ?></span>
+                        <?php endif; ?>
+                        <span class="text-muted">(<?= e($transaction['customer_mapping_status']) ?>)</span>
+                    </dd>
+                    <dt class="col-sm-3 col-lg-2"><?= $type === 'invoice' ? 'Invoice number' : 'Order number' ?></dt>
+                    <dd class="col-sm-9 col-lg-4"><?= e($transaction['reference_number'] ?: '—') ?></dd>
+                    <dt class="col-sm-3 col-lg-2">Date</dt>
+                    <dd class="col-sm-9 col-lg-4"><?= e($transaction['transaction_date']) ?></dd>
+                    <dt class="col-sm-3 col-lg-2">P.O. number</dt>
+                    <dd class="col-sm-9 col-lg-4"><?= e($transaction['po_number'] ?? '—') ?></dd>
+                    <?php if (trim((string)($transaction['memo'] ?? '')) !== ''): ?>
+                        <dt class="col-sm-3 col-lg-2">Memo</dt>
+                        <dd class="col-sm-9 col-lg-10"><?= e($transaction['memo']) ?></dd>
+                    <?php endif; ?>
                 </dl>
                 <div class="table-responsive">
-                    <table class="table table-sm">
+                    <table class="table table-sm qb-preview-lines">
                         <thead>
                             <tr>
-                                <th>Line / Item</th>
-                                <th>Mapping</th>
-                                <th><?= $type === 'invoice' ? 'Local Item Code (not sent)' : 'Item Code' ?></th>
+                                <th>Item</th>
                                 <th>Description</th>
-                                <th>Qty</th>
-                                <th>Rate</th>
-                                <th>Expected amount</th>
+                                <th>Item Code<?= $type === 'invoice' ? ' (local only)' : '' ?></th>
+                                <th>Quantity</th>
+                                <th>U/M</th>
+                                <th>Effective Unit Price</th>
+                                <th>Line Amount</th>
+                                <th>Site</th>
                                 <th>Tax</th>
-                                <th>Site / Lot / Expiry / U/M</th>
-                                <th>Other local fields</th>
                             </tr>
                         </thead>
                         <tbody><?php foreach ($transaction['lines'] as $line): ?><tr>
-                                    <td><?= (int)$line['line'] ?> — <?= e($line['product_name']) ?></td>
-                                    <td><?= e($line['item_mapping_status']) ?><?= $line['item_list_id'] ? ' (' . e($line['item_list_id']) . ')' : '' ?></td>
-                                    <td><?= e($line['item_code'] ?? '—') ?></td>
+                                    <td>
+                                        <?= e($line['product_name']) ?>
+                                        <small class="d-block text-muted"><?= e($line['item_mapping_status']) ?></small>
+                                        <?php if (!empty($line['item_full_name'])): ?>
+                                            <small class="d-block text-muted">QuickBooks FullName candidate: <?= e($line['item_full_name']) ?></small>
+                                        <?php endif; ?>
+                                    </td>
                                     <td><?= e($line['description']) ?></td>
+                                    <td><?= e($line['item_code'] ?? '—') ?></td>
                                     <td><?= e($line['quantity']) ?></td>
-                                    <td><?= e($line['rate']) ?></td>
-                                    <td><?= e($line['expected_amount'] ?? 'invalid') ?></td>
-                                    <td><?= e($line['tax_code'] ?? '(missing)') ?> — <?= e($line['tax_mapping_status']) ?></td>
-                                    <td>Site: <?= e($line['site'] ?? '(missing)') ?> / <?= e($line['site_mapping_status']) ?>; Lot: <?= e($line['lot_number'] ?? '—') ?>; Expiry: <?= e($line['expiration_date'] ?? '—') ?>; U/M: <?= e($line['unit_of_measure'] ?? '—') ?> (<?= e($line['unit_mapping_status']) ?>)</td>
-                                    <td>Class: <?= e($line['class_name'] ?? '—') ?>; Status: <?= e($line['line_status'] ?? '—') ?>; Fulfilled: <?= e($line['fulfilled_quantity'] ?? '—') ?></td>
+                                    <td>
+                                        <?= e($line['unit_of_measure'] ?? '—') ?>
+                                        <small class="d-block text-muted"><?= e($line['unit_mapping_status']) ?></small>
+                                    </td>
+                                    <td>
+                                        <?= e(trim((string)$line['rate']) !== '' ? $line['rate'] : '—') ?>
+                                        <small class="d-block text-muted"><?= e($line['pricing_status']) ?></small>
+                                    </td>
+                                    <td><?= e($line['expected_amount'] ?? '—') ?></td>
+                                    <td>
+                                        <?= e($line['site'] ?? '—') ?>
+                                        <small class="d-block text-muted"><?= e($line['site_mapping_status']) ?></small>
+                                        <?php if (!empty($line['lot_number']) || !empty($line['expiration_date'])): ?>
+                                            <small class="d-block text-muted">
+                                                Lot: <?= e($line['lot_number'] ?? '—') ?> · Expiry: <?= e($line['expiration_date'] ?? '—') ?>
+                                            </small>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <?php if (($transaction['preparation_mode'] ?? null) === 'quickbooks_managed_defaults'): ?>
+                                            <?= e($line['tax_mapping_status']) ?>
+                                        <?php else: ?>
+                                            <?= e($line['tax_code'] ?? '(missing)') ?> — <?= e($line['tax_mapping_status']) ?>
+                                        <?php endif; ?>
+                                    </td>
                                 </tr><?php endforeach; ?></tbody>
                     </table>
                 </div>
+                <div class="qb-preview-total">
+                    <span>Line subtotal</span>
+                    <strong><?= e($transaction['expected_subtotal']) ?></strong>
+                </div>
+                <p class="form-text mb-0">Tax / total: <?= e($transaction['tax_total_status']) ?><?= $type === 'sales_order' ? '; total unresolved' : '' ?></p>
             <?php endif; ?>
-            <?php if ($preview['errors']): ?><h4>Blocking validation errors</h4>
+            <h4 class="h6 mt-4">Validation and Actions</h4>
+            <?php if ($preview['errors']): ?>
                 <ul class="mb-0">
                     <?php foreach ($preview['errors'] as $error): ?><li><code><?= e($error['path']) ?></code> — <?= e($error['message']) ?> <small>(<?= e($error['code']) ?>)</small></li><?php endforeach; ?>
                 </ul><?php else: ?>
@@ -729,7 +963,7 @@ require __DIR__ . '/includes/layout_start.php';
                     <input type="hidden" name="source_id" value="<?= (int)$sourceId ?>">
                     <input type="hidden" name="source_revision" value="<?= e($preview['source_revision']) ?>">
                     <button class="btn btn-outline-primary" type="submit">Save pending preview record</button>
-                    <span class="form-text ms-2">This stores a pending snapshot only; it does not contact QuickBooks.</span>
+                    <span class="form-text ms-2">Saves a pending snapshot only; FullName candidates are checked against the current company before saving.</span>
                 </form>
             <?php endif; ?>
         </div>
@@ -754,7 +988,10 @@ require __DIR__ . '/includes/layout_start.php';
                     <dt class="col-sm-3">Invoice reference</dt>
                     <dd class="col-sm-9"><?= e($selectedSnapshot['reference_number'] ?? '') ?></dd>
                     <dt class="col-sm-3">Customer</dt>
-                    <dd class="col-sm-9"><?= e($selectedSnapshot['customer'] ?? '') ?> (<?= e($selectedSnapshot['customer_list_id'] ?? '') ?>)</dd>
+                    <dd class="col-sm-9">
+                        <?= e($selectedSnapshot['customer'] ?? '') ?>
+                        (<?= e($selectedSnapshot['customer_full_name'] ?? $selectedSnapshot['customer_list_id'] ?? '') ?>)
+                    </dd>
                     <dt class="col-sm-3">Date / subtotal</dt>
                     <dd class="col-sm-9"><?= e($selectedSnapshot['transaction_date'] ?? '') ?> / <?= e($selectedSnapshot['expected_subtotal'] ?? '') ?></dd>
                     <dt class="col-sm-3">Tax treatment</dt>
@@ -762,15 +999,16 @@ require __DIR__ . '/includes/layout_start.php';
                 </dl>
                 <div class="table-responsive">
                     <table class="table table-sm">
-                        <thead><tr><th>Line</th><th>QuickBooks item</th><th>Description</th><th>Qty</th><th>Rate</th><th>Amount</th><th>Tax code</th><th>Site / lot / U/M</th></tr></thead>
+                        <thead><tr><th>Line</th><th>QuickBooks item</th><th>Description</th><th>Qty</th><th>Effective rate</th><th>Price source</th><th>Amount</th><th>Tax code</th><th>Site / lot / U/M</th></tr></thead>
                         <tbody>
                         <?php foreach (($selectedSnapshot['lines'] ?? []) as $line): ?>
                             <tr>
                                 <td><?= (int)($line['line'] ?? 0) ?></td>
-                                <td><?= e($line['item_list_id'] ?? '') ?></td>
+                                <td><?= e($line['item_full_name'] ?? $line['item_list_id'] ?? '') ?></td>
                                 <td><?= e($line['description'] ?? '') ?></td>
                                 <td><?= e($line['quantity'] ?? '') ?></td>
-                                <td><?= e($line['rate'] ?? '') ?></td>
+                                <td><?= e($line['rate'] ?? '—') ?></td>
+                                <td><?= e($line['pricing_status'] ?? 'Price source unresolved') ?></td>
                                 <td><?= e($line['expected_amount'] ?? '') ?></td>
                                 <td><?= e($line['tax_list_id'] ?? '') ?></td>
                                 <td><?= e($line['site'] ?? '') ?> / <?= e($line['lot_number'] ?? '—') ?> / <?= e($line['unit_of_measure'] ?? '—') ?></td>
@@ -784,8 +1022,8 @@ require __DIR__ . '/includes/layout_start.php';
             <?php endif; ?>
 
             <?php if ($selectedExport['status'] === 'pending' && $selectedExport['transaction_type'] === 'invoice'): ?>
+                <h4 class="h6 mt-4">Validation and Actions</h4>
                 <?php if (!empty($postPreflight['errors'])): ?>
-                    <h4>Posting preflight</h4>
                     <ul><?php foreach ($postPreflight['errors'] as $error): ?>
                         <li><code><?= e($error['code'] ?? 'PREFLIGHT') ?></code> — <?= e($error['message'] ?? 'Posting requirement is not satisfied.') ?></li>
                     <?php endforeach; ?></ul>
@@ -793,6 +1031,21 @@ require __DIR__ . '/includes/layout_start.php';
                 <form method="post" action="<?= e(APP_BASE_URL) ?>/backend/controllers/qb_export_post.php" class="border rounded p-3">
                     <input type="hidden" name="_csrf" value="<?= e(csrf_token()) ?>">
                     <input type="hidden" name="export_id" value="<?= e($selectedExport['export_id']) ?>">
+                    <?php
+                    $hasFullNameReferences = is_string($selectedSnapshot['customer_full_name'] ?? null)
+                        || count(array_filter(
+                            is_array($selectedSnapshot['lines'] ?? null) ? $selectedSnapshot['lines'] : [],
+                            static fn($line): bool => is_array($line) && is_string($line['item_full_name'] ?? null)
+                        )) > 0;
+                    ?>
+                    <?php if ($hasFullNameReferences): ?>
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="confirm-fullname-references" name="confirm_full_name_references" value="yes" required>
+                            <label class="form-check-label" for="confirm-fullname-references">
+                                I confirmed the displayed QuickBooks FullName reference(s) are the intended customer and items.
+                            </label>
+                        </div>
+                    <?php endif; ?>
                     <label class="form-label" for="confirm-invoice-reference">To confirm, type the exact invoice reference <strong><?= e($selectedSnapshot['reference_number'] ?? '') ?></strong></label>
                     <input class="form-control mb-3" id="confirm-invoice-reference" name="confirm_reference" autocomplete="off" required>
                     <button class="btn btn-danger" type="submit" <?= !($postPreflight['ready'] ?? false) || !is_array($selectedSnapshot) ? 'disabled' : '' ?>>Send to QuickBooks</button>
@@ -810,7 +1063,9 @@ require __DIR__ . '/includes/layout_start.php';
         </div>
     </section>
 <?php endif; ?>
-<section class="panel">
+<details class="qb-export-history mb-4">
+    <summary>Recent export records (<?= count($exports) ?>)</summary>
+<section class="panel mb-0">
     <div class="panel-header">
         <div>
             <h3>Typed export records</h3>
@@ -847,4 +1102,20 @@ require __DIR__ . '/includes/layout_start.php';
         </table>
     </div>
 </section>
+    </details>
+</div>
+<script>
+    (() => {
+        const diagnostics = document.querySelector('.qb-advanced-diagnostics');
+        if (!diagnostics) return;
+        if (['#advanced-diagnostics', '#reference-verification', '#quickbooks-company-diagnostics'].includes(window.location.hash)) {
+            diagnostics.open = true;
+        }
+        document.querySelectorAll('a[href="#advanced-diagnostics"]').forEach((link) => {
+            link.addEventListener('click', () => {
+                diagnostics.open = true;
+            });
+        });
+    })();
+</script>
 <?php require __DIR__ . '/includes/footer.php'; ?>

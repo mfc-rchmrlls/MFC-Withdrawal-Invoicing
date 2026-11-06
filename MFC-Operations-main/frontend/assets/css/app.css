@@ -2197,3 +2197,115 @@ textarea:focus-visible {
         padding: 7px 12px;
     }
 }
+
+html:has(.qb-export-page) {
+    overflow-x: clip;
+}
+
+.qb-export-page {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: clip;
+}
+
+.qb-connection-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 16px;
+}
+
+.qb-connection-grid>div {
+    min-width: 0;
+}
+
+.qb-summary-label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+}
+
+.qb-connection-grid strong {
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.qb-advanced-diagnostics,
+.qb-export-history {
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: #fff;
+}
+
+.qb-advanced-diagnostics>summary,
+.qb-export-history>summary {
+    cursor: pointer;
+    padding: 12px 16px;
+    color: #334155;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.qb-advanced-diagnostics[open]>summary,
+.qb-export-history[open]>summary {
+    border-bottom: 1px solid var(--line);
+}
+
+.qb-advanced-diagnostics>summary:focus-visible,
+.qb-export-history>summary:focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: -2px;
+}
+
+.qb-advanced-diagnostics>.panel {
+    margin: 12px;
+}
+
+.qb-transaction-meta {
+    margin-bottom: 12px;
+}
+
+.qb-transaction-meta dt {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.qb-transaction-meta dd {
+    font-size: 13px;
+}
+
+.qb-preview-total {
+    display: flex;
+    justify-content: flex-end;
+    gap: 24px;
+    padding: 12px 14px 4px;
+    font-size: 13px;
+}
+
+.qb-preview-lines {
+    min-width: 940px;
+}
+
+@media (max-width: 760px) {
+    .qb-connection-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .qb-connection-summary .panel-header {
+        align-items: flex-start;
+    }
+
+    .qb-connection-summary .panel-header .btn {
+        flex: 0 0 auto;
+    }
+}
+
+@media (max-width: 480px) {
+    .qb-connection-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+}

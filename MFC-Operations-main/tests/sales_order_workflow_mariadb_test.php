@@ -1,6 +1,7 @@
 <?php
 
 declare(strict_types=1);
+require_once __DIR__ . '/../backend/core/functions.php';
 
 $host = getenv('WQ_DB_HOST') ?: '127.0.0.1';
 $user = getenv('WQ_DB_USER') ?: 'root';
@@ -265,8 +266,9 @@ try {
             item_code VARCHAR(100) NULL,
             description VARCHAR(255) NULL,
             u_m VARCHAR(40) NULL,
-            price_each DECIMAL(12,2) NOT NULL DEFAULT 0,
-            amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+            price_each DECIMAL(12,2) NULL DEFAULT NULL,
+            amount DECIMAL(14,2) NULL DEFAULT NULL,
+            price_source ENUM('mfc_entered','quickbooks_pending','quickbooks_verified','explicit_zero','unresolved') NOT NULL DEFAULT 'unresolved',
             tax_code ENUM('Non','Tax') NOT NULL DEFAULT 'Non',
             expiration_date DATE NULL,
             created_by BIGINT UNSIGNED NULL,
@@ -370,12 +372,77 @@ try {
     $pdo->exec("UPDATE products SET item_code='SKU-1' WHERE id=1");
     sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
     $invoice = $pdo->query('SELECT customer_id,invoice_number,status FROM invoices WHERE id=1')->fetch();
-    $invoiceLine = $pdo->query('SELECT u_m,site_id,lot_number,expiration_date,tax_code,quantity,price_each,amount FROM invoice_items WHERE invoice_id=1')->fetch();
+    $invoiceLine = $pdo->query('SELECT u_m,site_id,lot_number,expiration_date,tax_code,quantity,price_each,amount,price_source FROM invoice_items WHERE invoice_id=1')->fetch();
     sales_order_assert($invoice['invoice_number'] === 'INV-QA-1' && $invoice['status'] === 'Draft', 'invoice controller persists an editable draft header');
     sales_order_assert($invoiceLine['u_m'] === 'BOX', 'invoice controller uses Product Master U/M instead of submitted U/M');
     sales_order_assert((int)$invoiceLine['site_id'] === 1 && $invoiceLine['tax_code'] === 'Non', 'invoice controller saves a valid required Site and documented TAX value');
     sales_order_assert($invoiceLine['lot_number'] === null && $invoiceLine['expiration_date'] === null, 'invoice controller accepts blank Lot Number and Expiration Date');
     sales_order_assert((int)$invoiceLine['quantity'] === 3 && (float)$invoiceLine['price_each'] === 12.5 && (float)$invoiceLine['amount'] === 37.5, 'invoice controller persists the expected quantity, rate, and recalculated amount');
+    sales_order_assert($invoiceLine['price_source'] === 'mfc_entered', 'invoice controller records explicit MFC-entered price provenance');
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
+    $invoicePayload['items'][0]['price_each'] = '';
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    $pendingPrice = $pdo->query('SELECT price_each,amount,price_source FROM invoice_items WHERE invoice_id=1')->fetch();
+    sales_order_assert($pendingPrice['price_each'] === null && $pendingPrice['amount'] === null
+        && $pendingPrice['price_source'] === 'quickbooks_pending',
+        'clearing a tracked MFC price stores a pending blank instead of converting it to zero');
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
+    $invoicePayload['items'][0]['price_each'] = '0.00';
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    $explicitZero = $pdo->query('SELECT price_each,amount,price_source FROM invoice_items WHERE invoice_id=1')->fetch();
+    sales_order_assert((float)$explicitZero['price_each'] === 0.0 && (float)$explicitZero['amount'] === 0.0
+        && $explicitZero['price_source'] === 'explicit_zero',
+        'an explicitly entered zero is preserved as distinct from a missing price');
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
+    $invoicePayload['items'][0]['price_each'] = '12.50';
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
+    $pdo->exec("UPDATE invoice_items SET price_source='unresolved' WHERE invoice_id=1");
+    $invoicePayload['items'][0]['price_each'] = '';
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    $historical = $pdo->query('SELECT price_each,amount,price_source FROM invoice_items WHERE invoice_id=1')->fetch();
+    sales_order_assert((float)$historical['price_each'] === 12.5 && (float)$historical['amount'] === 37.5
+        && $historical['price_source'] === 'unresolved',
+        'saving an untouched historical line preserves its original price and unresolved state');
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
+    $invoicePayload['items'][0]['price_each'] = '12.50';
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    sales_order_assert($pdo->query('SELECT price_source FROM invoice_items WHERE invoice_id=1')->fetchColumn() === 'unresolved',
+        'historical prices cannot be reclassified without explicit Admin confirmation');
+    $invoicePayload['items'][0]['confirm_historical_price'] = 'yes';
+    $currentInvoice = $pdo->query(
+        'SELECT i.*,w.withdrawal_no FROM invoices i JOIN withdrawals w ON w.id=i.withdrawal_id WHERE i.id=1'
+    )->fetch();
+    $currentLines = $pdo->query('SELECT * FROM invoice_items WHERE invoice_id=1 ORDER BY id')->fetchAll();
+    $invoicePayload['invoice_revision'] = invoice_draft_revision($currentInvoice, $currentLines);
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    sales_order_assert($pdo->query('SELECT price_source FROM invoice_items WHERE invoice_id=1')->fetchColumn() === 'mfc_entered',
+        'Admin confirmation explicitly adopts a re-entered historical price as MFC-entered');
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
+    $pdo->exec("UPDATE invoice_items SET price_each='0.00',amount='0.00',price_source='unresolved' WHERE invoice_id=1");
+    $invoicePayload['items'][0]['price_each'] = '0.00';
+    unset($invoicePayload['items'][0]['confirm_historical_price'], $invoicePayload['invoice_revision']);
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    sales_order_assert($pdo->query('SELECT price_source FROM invoice_items WHERE invoice_id=1')->fetchColumn() === 'unresolved'
+        && (float)$pdo->query('SELECT price_each FROM invoice_items WHERE invoice_id=1')->fetchColumn() === 0.0,
+        'a historical stored zero is not reclassified without explicit Admin confirmation');
+    $invoicePayload['items'][0]['confirm_historical_price'] = 'yes';
+    $invoicePayload['invoice_revision'] = str_repeat('0', 64);
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    sales_order_assert($pdo->query('SELECT price_source FROM invoice_items WHERE invoice_id=1')->fetchColumn() === 'unresolved',
+        'a stale invoice revision cannot confirm a historical stored zero');
+    $currentInvoice = $pdo->query(
+        'SELECT i.*,w.withdrawal_no FROM invoices i JOIN withdrawals w ON w.id=i.withdrawal_id WHERE i.id=1'
+    )->fetch();
+    $currentLines = $pdo->query('SELECT * FROM invoice_items WHERE invoice_id=1 ORDER BY id')->fetchAll();
+    $invoicePayload['invoice_revision'] = invoice_draft_revision($currentInvoice, $currentLines);
+    sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
+    $confirmedHistoricalZero = $pdo->query('SELECT price_each,amount,price_source FROM invoice_items WHERE invoice_id=1')->fetch();
+    sales_order_assert((float)$confirmedHistoricalZero['price_each'] === 0.0
+        && (float)$confirmedHistoricalZero['amount'] === 0.0
+        && $confirmedHistoricalZero['price_source'] === 'explicit_zero',
+        'Admin confirmation for the current invoice revision adopts the unchanged stored zero');
+    $invoicePayload['items'][0]['id'] = (string)$pdo->query('SELECT id FROM invoice_items WHERE invoice_id=1')->fetchColumn();
     $invoicePayload['items'][0]['tax_code'] = '';
     sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
     $unchangedTax = $pdo->query('SELECT tax_code FROM invoice_items WHERE invoice_id=1')->fetchColumn();
@@ -385,7 +452,7 @@ try {
     sales_order_run_controller($invoiceControllerPath, $invoicePayload, $database, $previousDatabase);
     $unchangedLine = $pdo->query('SELECT site_id,quantity,amount FROM invoice_items WHERE invoice_id=1')->fetch();
     sales_order_assert(
-        (int)$unchangedLine['site_id'] === 1 && (int)$unchangedLine['quantity'] === 3 && (float)$unchangedLine['amount'] === 37.5,
+        (int)$unchangedLine['site_id'] === 1 && (int)$unchangedLine['quantity'] === 3 && (float)$unchangedLine['amount'] === 0.0,
         'invalid inactive/missing invoice Site rolls back without replacing the saved draft'
     );
 

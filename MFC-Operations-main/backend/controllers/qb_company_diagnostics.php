@@ -129,6 +129,8 @@ try {
 
     $result['available'] = $response['available'] ?? false;
     $result['diagnostic_code'] = $response['diagnostic_code'] ?? null;
+    $result['failure_stage'] = $response['failure_stage'] ?? null;
+    $result['sdk_error_code'] = $response['sdk_error_code'] ?? null;
     $result['message'] = $response['message'] ?? (
         $result['available']
         ? 'The signed diagnostic completed. Results are company-bound but do not establish posting eligibility.'
